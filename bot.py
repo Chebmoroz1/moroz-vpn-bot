@@ -1211,20 +1211,17 @@ class VPNBot:
     # Lifecycle
     # ──────────────────────────────────────
 
-    async def run(self) -> None:
-        """Start polling."""
+    def run(self) -> None:
+        """Start polling using the built-in run_polling helper."""
         logger.info("Starting VPNBot polling…")
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling()
-        await self.application.updater.idle()
+        self.application.run_polling()
 
 
-async def main() -> None:
+def main() -> None:
     bot = VPNBot()
-    await bot.run()
+    bot.run()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
 

@@ -4,8 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/vpn-bot/web_admin/backend
-ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8889
+WorkingDirectory=/opt/vpn-bot
+Environment=PYTHONPATH=/opt/vpn-bot
+ExecStart=/usr/bin/python3 -m uvicorn web_admin.backend.main:app --host 0.0.0.0 --port 8889
 Restart=always
 RestartSec=5
 User=www-data
