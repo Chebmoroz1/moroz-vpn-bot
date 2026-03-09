@@ -264,8 +264,20 @@ class VPNBot:
             admin_id = get_admin_id()
             user.is_admin = bool(admin_id and tg_user.id == admin_id)
 
+            # Admin should always have active status and a sane key limit
+            if user.is_admin and not user.is_active:
+                max_keys = user.max_keys or ConfigManager.get_auth_bypass_max_keys() or 1
+                user.is_active = True
+                user.max_keys = max_keys
+                user.activation_requested = False
+                logger.info(
+                    "Admin user %s auto-activated (tg_id=%s, max_keys=%d)",
+                    user.id,
+                    tg_user.id,
+                    max_keys,
+                )
+
             is_active = user.is_active
-            is_admin = user.is_admin
             is_admin = user.is_admin
 
         # Now send appropriate menu
