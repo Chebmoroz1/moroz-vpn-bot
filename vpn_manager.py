@@ -527,7 +527,7 @@ class VPNManager:
         """
         Full key creation flow:
 
-        1. Check user key limits.
+        1. Check user key limits (skipped for admin).
         2. Generate a WireGuard key pair.
         3. Find the next free IP address.
         4. Add the peer to the server.
@@ -548,20 +548,28 @@ class VPNManager:
         """
         try:
             # ── 1. Check limits ──────────────────────────
-            with get_db_session() as session:
-                active_keys = (
-                    session.query(VPNKey)
-                    .filter(VPNKey.user_id == user.id, VPNKey.is_active.is_(True))
-                    .count()
-                )
-                max_keys = user.max_keys or 0
-
-                if active_keys >= max_keys:
-                    logger.warning(
-                        "User %s (id=%d) reached key limit: %d/%d",
-                        user.username, user.id, active_keys, max_keys,
+            # Admin users are not subject to key limits.
+            if not user.is_admin:
+                with get_db_session() as session:
+                    active_keys = (
+                        session.query(VPNKey)
+                        .filter(
+                            VPNKey.user_id == user.id,
+                            VPNKey.is_active.is_(True),
+                        )
+                        .count()
                     )
-                    return None
+                    max_keys = user.max_keys or 0
+
+                    if max_keys > 0 and active_keys >= max_keys:
+                        logger.warning(
+                            "User %s (id=%d) reached key limit: %d/%d",
+                            user.username,
+                            user.id,
+                            active_keys,
+                            max_keys,
+                        )
+                        return None
 
             # ── 2. Generate key pair ─────────────────────
             private_key, public_key = await self.generate_keys()
