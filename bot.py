@@ -727,7 +727,21 @@ class VPNBot:
 
         await message.reply_text("Создаю новый VPN ключ, подожди несколько секунд…")
 
-        result = await self.vpn_manager.create_key(user)
+        # Protect the full key creation flow with a global timeout so that
+        # transient Docker / network issues do not block the bot forever.
+        try:
+            result = await asyncio.wait_for(
+                self.vpn_manager.create_key(user),
+                timeout=60,
+            )
+        except asyncio.TimeoutError:
+            logger.error("Key creation timed out for user id=%s", user.id)
+            await message.reply_text(
+                "Создание ключа занимает слишком много времени и было прервано. "
+                "Попробуй ещё раз чуть позже.",
+                reply_markup=build_main_keyboard(),
+            )
+            return
         if not result:
             await message.reply_text(
                 "Ошибка при генерации ключа. Подробнее смотри лог на сервере.",
