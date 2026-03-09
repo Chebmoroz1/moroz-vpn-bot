@@ -716,7 +716,7 @@ class VPNBot:
 
     async def _handle_create_key(self, user: User, message: Message) -> None:
         """Create new VPN key for the user respecting max_keys limit."""
-        # Check limits
+        # Check limits (except for admin, who has no key limit)
         with get_db_session() as session:
             active_count = (
                 session.query(VPNKey)
@@ -725,7 +725,7 @@ class VPNBot:
             )
             max_keys = user.max_keys or 0
 
-        if active_count >= max_keys:
+        if (not user.is_admin) and max_keys > 0 and active_count >= max_keys:
             await message.reply_text(
                 f"Лимит ключей исчерпан: {active_count} из {max_keys}. "
                 "Можно запросить дополнительный ключ через меню.",
