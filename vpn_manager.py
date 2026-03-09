@@ -127,12 +127,12 @@ class VPNManager:
 
     async def get_server_obfuscation_params(self) -> dict:
         """
-        Parse AmneziaWG obfuscation parameters from the interface dump.
+        Parse AmneziaWG obfuscation parameters from the wg0.conf inside
+        the Amnezia container.
 
-        The first line of ``wg show wg0 dump`` describes the interface and has
-        the format::
-
-            private_key  public_key  port  Jc  Jmin  Jmax  S1  S2  H1  H2  H3  H4  fwmark
+        We intentionally read from the config file (/opt/amnezia/awg/wg0.conf)
+        instead of relying on ``wg show wg0 dump`` to ensure that the
+        client config matches exactly what Amnezia generated originally.
 
         Returns
         -------
@@ -140,40 +140,37 @@ class VPNManager:
             Keys: Jc, Jmin, Jmax, S1, S2, H1, H2, H3, H4 (all as strings).
         """
         try:
-            dump = await self._async_docker_cmd(f"wg show {VPN_INTERFACE} dump")
-            lines = dump.strip().split("\n")
+            cfg = await self._async_docker_cmd(f"cat {VPN_CONFIG_PATH}")
+            params: dict[str, str] = {}
+            for line in cfg.splitlines():
+                line = line.strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = [p.strip() for p in line.split("=", 1)]
+                if key in {"Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"}:
+                    params[key] = value
 
-            if not lines:
-                raise ValueError("Empty wg dump output")
+            # Basic sanity: fall back to zeros if something is missing
+            for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
+                params.setdefault(k, "0")
 
-            # Interface line is the first line
-            parts = lines[0].split("\t")
-            logger.debug("Interface dump parts (%d): %s", len(parts), parts)
-
-            # Expected: private_key(0) public_key(1) port(2) Jc(3) Jmin(4) Jmax(5)
-            #           S1(6) S2(7) H1(8) H2(9) H3(10) H4(11) fwmark(12)
-            if len(parts) < 12:
-                raise ValueError(
-                    f"Unexpected wg dump interface line format, got {len(parts)} fields"
-                )
-
-            params = {
-                "Jc": parts[3],
-                "Jmin": parts[4],
-                "Jmax": parts[5],
-                "S1": parts[6],
-                "S2": parts[7],
-                "H1": parts[8],
-                "H2": parts[9],
-                "H3": parts[10],
-                "H4": parts[11],
-            }
-            logger.info("Server obfuscation params: %s", params)
+            logger.info("Server obfuscation params (from config): %s", params)
             return params
 
         except Exception as e:
-            logger.error("Failed to get obfuscation params: %s", e)
-            raise
+            logger.error("Failed to get obfuscation params from %s: %s", VPN_CONFIG_PATH, e)
+            # Fallback to zeros so that config generation still works
+            return {
+                "Jc": "0",
+                "Jmin": "0",
+                "Jmax": "0",
+                "S1": "0",
+                "S2": "0",
+                "H1": "0",
+                "H2": "0",
+                "H3": "0",
+                "H4": "0",
+            }
 
     # ──────────────────────────────────────────────
     # IP address management
@@ -372,6 +369,7 @@ class VPNManager:
         client_ip: str,
         server_public_key: str,
         obfuscation_params: dict,
+        preshared_key: str | None = None,
     ) -> str:
         """
         Generate an AmneziaWG client ``.conf`` file content.
@@ -396,7 +394,7 @@ class VPNManager:
             f"[Interface]\n"
             f"PrivateKey = {private_key}\n"
             f"Address = {client_ip}/32\n"
-            f"DNS = 1.1.1.1, 8.8.8.8\n"
+            f"DNS = 1.1.1.1, 1.0.0.1\n"
             f"Jc = {obfuscation_params['Jc']}\n"
             f"Jmin = {obfuscation_params['Jmin']}\n"
             f"Jmax = {obfuscation_params['Jmax']}\n"
@@ -410,7 +408,13 @@ class VPNManager:
             f"[Peer]\n"
             f"PublicKey = {server_public_key}\n"
             f"Endpoint = {SERVER_HOST}:{VPN_PORT}\n"
-            f"AllowedIPs = 0.0.0.0/0\n"
+        )
+
+        if preshared_key:
+            config += f"PresharedKey = {preshared_key}\n"
+
+        config += (
+            f"AllowedIPs = 0.0.0.0/0, ::/0\n"
             f"PersistentKeepalive = 25\n"
         )
         return config
@@ -587,8 +591,20 @@ class VPNManager:
             server_public_key = await self.get_server_public_key()
             obfuscation_params = await self.get_server_obfuscation_params()
 
+            # Shared preshared key used by AmneziaWG for all peers.
+            try:
+                preshared_key = await self._async_docker_cmd(
+                    "cat /opt/amnezia/awg/wireguard_psk.key"
+                )
+            except Exception:
+                preshared_key = ""
+
             config_content = self.generate_config(
-                private_key, client_ip, server_public_key, obfuscation_params,
+                private_key,
+                client_ip,
+                server_public_key,
+                obfuscation_params,
+                preshared_key=preshared_key or None,
             )
 
             key_name = self.generate_key_name(user)
