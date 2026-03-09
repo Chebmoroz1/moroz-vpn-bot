@@ -509,15 +509,23 @@ class VPNBot:
                     user.activation_requested = True
                     msg = UserMessage(
                         user_id=user.id,
-                        message_type="other",
+                        message_type="activation",
                         message_text="Запрос активации аккаунта",
                     )
                     session.add(msg)
+                    session.flush()
                     logger.info(
                         "User %s requested activation (telegram_id=%s)",
                         user.id,
                         tg_user.id,
                     )
+
+                    # Notify admin with user details and inline approval controls.
+                    await self._notify_admin_activation_request(
+                        user=user,
+                        msg_id=msg.id,
+                    )
+
                     await message.reply_text(
                         "Запрос на активацию отправлен администратору. "
                         "Вы получите уведомление после рассмотрения.",
@@ -1092,6 +1100,10 @@ class VPNBot:
                 await self._cb_delete_key(query)
             elif data.startswith("msgdone:"):
                 await self._cb_mark_message_done(query)
+            elif data.startswith("actok:"):
+                await self._cb_activation_approve(query)
+            elif data.startswith("actrej:"):
+                await self._cb_activation_reject(query)
             else:
                 await query.answer(
                     "Эта кнопка пока не активна. Откройте главное меню через «📱 Меню».",
@@ -1162,6 +1174,208 @@ class VPNBot:
                 # Fallback: just send info message
                 await query.message.reply_text("Сообщение помечено как обработанное.")
 
+    async def _cb_activation_approve(self, query: CallbackQuery) -> None:
+        """Approve an account activation request and set max_keys."""
+        await query.answer()
+        data = query.data or ""
+        try:
+            _, msg_id_str, keys_str = data.split(":", 2)
+            msg_id = int(msg_id_str)
+            max_keys = int(keys_str)
+        except (ValueError, IndexError):
+            return
+
+        if max_keys <= 0:
+            max_keys = 1
+
+        with get_db_session() as session:
+            msg = session.query(UserMessage).filter(UserMessage.id == msg_id).first()
+            if not msg:
+                if query.message:
+                    await query.edit_message_text("Запрос активации не найден.")
+                return
+
+            user = session.query(User).filter(User.id == msg.user_id).first()
+            if not user:
+                if query.message:
+                    await query.edit_message_text("Пользователь для этого запроса не найден.")
+                return
+
+            user.is_active = True
+            user.max_keys = max_keys
+            user.activation_requested = False
+            msg.status = "approved"
+            msg.replied_at = datetime.utcnow()
+
+        user_label = (
+            user.nickname
+            or user.username
+            or f"{user.first_name or ''} {user.last_name or ''}".strip()
+            or f"user#{user.id}"
+        )
+
+        # Update admin message UI
+        if query.message:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await query.message.reply_text(
+                f"✅ Аккаунт пользователя {user_label} активирован, "
+                f"выдано ключей: {max_keys}.",
+                reply_markup=build_admin_keyboard(),
+            )
+
+        # Notify user about activation
+        if user.telegram_id:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=(
+                        "✅ Твой аккаунт в MOROZ VPN активирован.\n\n"
+                        f"Тебе доступно ключей: {max_keys}.\n"
+                        "Открой «📱 Меню», чтобы получить ключ."
+                    ),
+                    reply_markup=build_main_keyboard(),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to notify user %s about activation: %s",
+                    user.telegram_id,
+                    e,
+                )
+
+    async def _cb_activation_reject(self, query: CallbackQuery) -> None:
+        """Reject an account activation request."""
+        await query.answer()
+        data = query.data or ""
+        try:
+            msg_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            return
+
+        with get_db_session() as session:
+            msg = session.query(UserMessage).filter(UserMessage.id == msg_id).first()
+            if not msg:
+                if query.message:
+                    await query.edit_message_text("Запрос активации не найден.")
+                return
+
+            user = session.query(User).filter(User.id == msg.user_id).first()
+            if not user:
+                if query.message:
+                    await query.edit_message_text("Пользователь для этого запроса не найден.")
+                return
+
+            msg.status = "rejected"
+            msg.replied_at = datetime.utcnow()
+            user.activation_requested = False
+
+        user_label = (
+            user.nickname
+            or user.username
+            or f"{user.first_name or ''} {user.last_name or ''}".strip()
+            or f"user#{user.id}"
+        )
+
+        # Update admin message UI
+        if query.message:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await query.message.reply_text(
+                f"❌ Запрос активации пользователя {user_label} отклонён.",
+                reply_markup=build_admin_keyboard(),
+            )
+
+        # Notify user about rejection
+        if user.telegram_id:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=(
+                        "К сожалению, запрос на активацию аккаунта отклонён.\n\n"
+                        "Если считаешь, что это ошибка, свяжись с администратором."
+                    ),
+                    reply_markup=build_inactive_user_keyboard(),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to notify user %s about activation rejection: %s",
+                    user.telegram_id,
+                    e,
+                )
+
+    async def _notify_admin_activation_request(
+        self,
+        user: User,
+        msg_id: int,
+    ) -> None:
+        """Notify admin about an account activation request with inline controls."""
+        admin_id = get_admin_id()
+        if not admin_id:
+            return
+
+        user_label = (
+            user.nickname
+            or user.username
+            or f"{user.first_name or ''} {user.last_name or ''}".strip()
+            or f"user#{user.id}"
+        )
+
+        lines = [
+            "🔓 Запрос активации аккаунта",
+            "",
+            f"Пользователь: {user_label}",
+            f"Telegram ID: {user.telegram_id}",
+            f"ID в БД: {user.id}",
+            f"Телефон: {user.phone_number or '—'}",
+            "",
+            "Выбери, сколько ключей выдать при активации, "
+            "или отклони запрос.",
+        ]
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="✅ Одобрить (1 ключ)",
+                        callback_data=f"actok:{msg_id}:1",
+                    ),
+                    InlineKeyboardButton(
+                        text="✅ Одобрить (2 ключа)",
+                        callback_data=f"actok:{msg_id}:2",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="✅ Одобрить (3 ключа)",
+                        callback_data=f"actok:{msg_id}:3",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отклонить",
+                        callback_data=f"actrej:{msg_id}",
+                    ),
+                ],
+            ]
+        )
+
+        try:
+            await self.application.bot.send_message(
+                chat_id=admin_id,
+                text="\n".join(lines),
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to notify admin about activation request msg_id=%s: %s",
+                msg_id,
+                e,
+            )
+
     async def _notify_admin_new_message(
         self,
         user: User,
@@ -1178,6 +1392,7 @@ class VPNBot:
             "question": "❓ Вопрос",
             "problem": "🐛 Проблема",
             "key_request": "🔑 Запрос ключа",
+            "activation": "🔓 Запрос активации",
         }.get(message_type, "📨 Сообщение")
 
         user_label = (
