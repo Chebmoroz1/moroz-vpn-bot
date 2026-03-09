@@ -84,8 +84,15 @@ MAIN_MENU_BUTTON: Final[str] = "📱 Меню"
 
 
 def build_main_keyboard() -> ReplyKeyboardMarkup:
-    """Build persistent reply keyboard with the main menu button."""
-    keyboard = [[KeyboardButton(MAIN_MENU_BUTTON)]]
+    """Build main menu keyboard with all core actions and the menu button."""
+    keyboard = [
+        [KeyboardButton(MAIN_MENU_BUTTON)],
+        [KeyboardButton("🔐 Получить AmneziaWG ключ")],
+        [KeyboardButton("📋 Мои ключи"), KeyboardButton("📊 Статус подключения")],
+        [KeyboardButton("🔑 Запросить ещё ключ")],
+        [KeyboardButton("❓ Задать вопрос"), KeyboardButton("🐛 Сообщить о проблеме")],
+        [KeyboardButton("ℹ️ Помощь")],
+    ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
