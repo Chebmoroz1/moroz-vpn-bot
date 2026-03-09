@@ -95,6 +95,7 @@ def build_inactive_user_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("🔓 Запросить активацию")],
         [KeyboardButton("📱 Предоставить телефон")],
         [KeyboardButton("❓ Задать вопрос")],
+        [KeyboardButton(MAIN_MENU_BUTTON)],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -106,7 +107,7 @@ def build_admin_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("📨 Входящие"), KeyboardButton("📢 Рассылка")],
         [KeyboardButton("🔓 Открытый доступ"), KeyboardButton("⚙️ Настройки")],
         [KeyboardButton("📊 Статистика"), KeyboardButton("🔄 Синхронизировать ключи")],
-        [KeyboardButton("⬅️ Назад")],
+        [KeyboardButton("⬅️ Назад"), KeyboardButton(MAIN_MENU_BUTTON)],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -367,9 +368,14 @@ class VPNBot:
 
             # Check if we are waiting for a follow‑up text from this user
             pending = self._pending_inputs.pop(user.id, None)
-            if pending and message.text:
-                kind = pending.get("kind")
 
+            # Global "📱 Меню" button: always open the appropriate menu and
+            # effectively cancel any pending multi-step flow.
+            if text == MAIN_MENU_BUTTON:
+                await self.cmd_menu(update, context)
+                return
+
+            if pending and message.text:
                 # Store user message in DB according to the pending kind
                 if kind in {"question", "problem", "key_request"}:
                     text_to_store = message.text.strip()
@@ -603,6 +609,16 @@ class VPNBot:
         contact = update.effective_message.contact if update.effective_message else None
 
         if tg_user is None or contact is None:
+            return
+
+        # Soft check: when Telegram provides contact.user_id, ensure users
+        # only share their own contact, not someone else's.
+        if getattr(contact, "user_id", None) and contact.user_id != tg_user.id:
+            await update.effective_message.reply_text(
+                "Пожалуйста, отправь именно свой номер через кнопку "
+                "«Поделиться номером телефона», а не контакт другого человека.",
+                reply_markup=build_inactive_user_keyboard(),
+            )
             return
 
         normalized = normalize_phone(contact.phone_number)
