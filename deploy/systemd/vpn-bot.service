@@ -1,0 +1,15 @@
+[Unit]
+Description=MOROZ VPN Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vpn-bot
+ExecStart=/usr/bin/python3 /opt/vpn-bot/bot.py
+Restart=always
+RestartSec=5
+User=www-data
+
+[Install]
+WantedBy=multi-user.target
+

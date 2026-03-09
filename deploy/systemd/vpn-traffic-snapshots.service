@@ -1,0 +1,11 @@
+[Unit]
+Description=MOROZ VPN traffic snapshots collector
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/vpn-bot
+ExecStart=/usr/bin/python3 /opt/vpn-bot/sync_traffic_snapshots.py
+
+[Install]
+WantedBy=multi-user.target
+

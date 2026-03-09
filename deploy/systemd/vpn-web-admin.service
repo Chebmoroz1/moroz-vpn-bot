@@ -1,0 +1,15 @@
+[Unit]
+Description=MOROZ VPN Web Admin (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vpn-bot/web_admin/backend
+ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8889
+Restart=always
+RestartSec=5
+User=www-data
+
+[Install]
+WantedBy=multi-user.target
+

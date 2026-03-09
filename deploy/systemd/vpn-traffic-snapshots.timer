@@ -1,0 +1,11 @@
+[Unit]
+Description=Run MOROZ VPN traffic snapshots every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=vpn-traffic-snapshots.service
+
+[Install]
+WantedBy=timers.target
+
