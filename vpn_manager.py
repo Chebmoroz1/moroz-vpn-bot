@@ -331,12 +331,11 @@ class VPNManager:
                 )
                 return None
 
-            # Generate a unique preshared key for this peer.
-            preshared_key = await self._async_docker_cmd("wg genpsk")
-
-            # Store PSK in a temporary file inside the container so wg can read it.
-            await self._async_docker_cmd(
-                f"bash -c 'echo {preshared_key} > /tmp/psk'"
+            # Generate a unique preshared key for this peer *inside* the container
+            # and store it in /tmp/psk in a single, atomic operation to avoid
+            # shell-escaping issues for special characters.
+            preshared_key = await self._async_docker_cmd(
+                "bash -lc 'wg genpsk | tee /tmp/psk'"
             )
 
             # Add peer to the live interface with its own preshared key and allowed IP.
