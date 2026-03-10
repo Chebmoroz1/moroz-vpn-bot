@@ -1,0 +1,154 @@
+.traffic-users-list {
+  margin-top: 30px;
+}
+
+.users-list-header {
+  margin-bottom: 20px;
+}
+
+.users-list-header h2 {
+  margin: 0 0 15px 0;
+  color: #2c3e50;
+  font-size: 24px;
+}
+
+.users-list-controls {
+  display: flex;
+  gap: 15px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.period-selector {
+  display: flex;
+  gap: 8px;
+  background: white;
+  padding: 4px;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.period-selector button {
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #2c3e50;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s;
+}
+
+.period-selector button:hover {
+  background: #f8f9fa;
+}
+
+.period-selector button.active {
+  background: #3498db;
+  color: white;
+}
+
+.users-search {
+  flex: 1;
+  min-width: 200px;
+  padding: 10px 15px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 14px;
+}
+
+.users-search:focus {
+  outline: none;
+  border-color: #3498db;
+}
+
+.refresh-btn,
+.expand-all-btn {
+  padding: 10px 20px;
+  background-color: #3498db;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: background-color 0.3s;
+}
+
+.refresh-btn:hover,
+.expand-all-btn:hover {
+  background-color: #2980b9;
+}
+
+.refresh-btn:disabled {
+  background-color: #95a5a6;
+  cursor: not-allowed;
+}
+
+.traffic-users-loading,
+.users-empty {
+  text-align: center;
+  padding: 50px;
+  font-size: 16px;
+  color: #7f8c8d;
+}
+
+.users-list {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.users-pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 20px;
+  margin-top: 30px;
+  padding: 20px;
+}
+
+.users-pagination button {
+  padding: 10px 20px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: white;
+  color: #2c3e50;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s;
+}
+
+.users-pagination button:hover:not(:disabled) {
+  background: #f8f9fa;
+  border-color: #3498db;
+}
+
+.users-pagination button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.users-pagination span {
+  color: #7f8c8d;
+  font-size: 14px;
+}
+
+@media (max-width: 768px) {
+  .users-list-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  
+  .period-selector {
+    width: 100%;
+  }
+  
+  .period-selector button {
+    flex: 1;
+  }
+  
+  .users-search {
+    width: 100%;
+  }
+}
+

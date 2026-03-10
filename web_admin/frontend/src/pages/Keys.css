@@ -1,0 +1,193 @@
+.keys {
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.keys-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+  gap: 15px;
+}
+
+.keys-header h1 {
+  margin: 0;
+  color: #2c3e50;
+}
+
+.keys-filters {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.user-filter {
+  padding: 10px 15px;
+  border: 1px solid #ddd;
+  border-radius: 5px;
+  font-size: 14px;
+  background: white;
+  cursor: pointer;
+}
+
+.refresh-btn {
+  padding: 10px 20px;
+  background-color: #3498db;
+  color: white;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: background-color 0.3s;
+}
+
+.refresh-btn:hover {
+  background-color: #2980b9;
+}
+
+.keys-loading,
+.keys-empty {
+  text-align: center;
+  padding: 50px;
+  font-size: 18px;
+  color: #7f8c8d;
+}
+
+.keys-table-container {
+  background: white;
+  border-radius: 10px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+  overflow-x: auto;
+}
+
+.keys-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.keys-table thead {
+  background-color: #34495e;
+  color: white;
+}
+
+.keys-table th {
+  padding: 15px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 14px;
+  text-transform: uppercase;
+}
+
+.keys-table tbody tr {
+  border-bottom: 1px solid #ecf0f1;
+  transition: background-color 0.2s;
+}
+
+.keys-table tbody tr:hover {
+  background-color: #f8f9fa;
+}
+
+.keys-table tbody tr.inactive {
+  opacity: 0.6;
+}
+
+.keys-table td {
+  padding: 15px;
+  font-size: 14px;
+  color: #2c3e50;
+}
+
+.access-type {
+  padding: 5px 10px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.access-type.test {
+  background-color: #fff3cd;
+  color: #856404;
+}
+
+.access-type.paid {
+  background-color: #d1ecf1;
+  color: #0c5460;
+}
+
+.access-type.free {
+  background-color: #d4edda;
+  color: #155724;
+}
+
+.access-type.donation {
+  background-color: #f8d7da;
+  color: #721c24;
+}
+
+.status-badge {
+  padding: 5px 10px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.status-badge.active {
+  background-color: #d4edda;
+  color: #155724;
+}
+
+.status-badge.inactive {
+  background-color: #f8d7da;
+  color: #721c24;
+}
+
+.action-buttons {
+  display: flex;
+  gap: 5px;
+}
+
+.action-buttons button {
+  padding: 5px 10px;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 16px;
+  transition: transform 0.2s;
+}
+
+.action-buttons button:hover {
+  transform: scale(1.1);
+}
+
+.btn-activate {
+  background-color: #28a745;
+  color: white;
+}
+
+.btn-deactivate {
+  background-color: #ffc107;
+  color: #000;
+}
+
+.btn-delete {
+  background-color: #dc3545;
+  color: white;
+}
+
+@media (max-width: 768px) {
+  .keys-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  
+  .keys-table-container {
+    overflow-x: scroll;
+  }
+  
+  .keys-table {
+    min-width: 1200px;
+  }
+}
+

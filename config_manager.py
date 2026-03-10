@@ -1,269 +1,143 @@
-"""
-Менеджер конфигурации приложения.
-Читает/записывает настройки из таблицы app_config в БД с кэшированием (TTL=5 мин).
-Приоритет: БД (app_config) → переменные окружения (.env) → значение по умолчанию.
-"""
-
-import os
-import time
+"""Менеджер настроек приложения (из БД)"""
 import logging
-from datetime import datetime
-
+from typing import Optional, Dict, List
 from database import get_db_session, AppConfig
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 
 class ConfigManager:
-    """
-    Централизованный менеджер настроек приложения.
-
-    Все настройки хранятся в таблице ``app_config`` и кэшируются
-    в памяти на 5 минут (``_cache_ttl``).  При промахе кэша выполняется
-    запрос к БД, затем проверяются переменные окружения, и наконец
-    используется переданное значение по умолчанию.
-    """
-
-    _cache: dict = {}          # key -> (value, timestamp)
-    _cache_ttl: int = 300      # 5 минут
-
-    # ------------------------------------------------------------------
-    # Основные методы чтения / записи
-    # ------------------------------------------------------------------
-
+    """Менеджер для работы с настройками из БД"""
+    
+    _cache: Dict[str, str] = {}
+    _cache_timestamp: Optional[datetime] = None
+    _cache_ttl: int = 300  # 5 минут кэширования
+    
     @classmethod
-    def get(cls, key: str, default: str | None = None) -> str | None:
-        """Получить значение настройки.
-
-        Приоритет: кэш (если не истёк) → БД → os.environ → default.
-        """
-        # 1. Проверка кэша
-        cached = cls._cache.get(key)
-        if cached is not None:
-            value, ts = cached
-            if time.time() - ts < cls._cache_ttl:
+    def get(cls, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Получение значения настройки"""
+        # Проверяем кэш
+        if cls._cache_timestamp:
+            age = (datetime.now() - cls._cache_timestamp).seconds
+            if age < cls._cache_ttl and key in cls._cache:
+                return cls._cache[key]
+        
+        # Получаем из БД
+        db = get_db_session()
+        try:
+            config = db.query(AppConfig).filter(AppConfig.key == key).first()
+            if config:
+                value = config.value
+                # Обновляем кэш
+                cls._cache[key] = value
+                cls._cache_timestamp = datetime.now()
                 return value
-
-        # 2. Запрос к БД
-        try:
-            with get_db_session() as session:
-                entry = (
-                    session.query(AppConfig)
-                    .filter(AppConfig.key == key)
-                    .first()
-                )
-                if entry is not None:
-                    cls._cache[key] = (entry.value, time.time())
-                    return entry.value
-        except Exception as e:
-            logger.error("Ошибка при чтении настройки '%s' из БД: %s", key, e)
-
-        # 3. Переменные окружения
-        env_value = os.environ.get(key)
-        if env_value is not None:
-            cls._cache[key] = (env_value, time.time())
-            return env_value
-
-        # 4. Значение по умолчанию
-        return default
-
-    @classmethod
-    def set(
-        cls,
-        key: str,
-        value: str,
-        description: str | None = None,
-        is_secret: bool = False,
-        category: str = "general",
-    ) -> None:
-        """Записать значение настройки в БД и обновить кэш."""
-        try:
-            with get_db_session() as session:
-                entry = (
-                    session.query(AppConfig)
-                    .filter(AppConfig.key == key)
-                    .first()
-                )
-                if entry is not None:
-                    entry.value = value
-                    if description is not None:
-                        entry.description = description
-                    entry.is_secret = is_secret
-                    entry.category = category
-                    entry.updated_at = datetime.now()
-                else:
-                    entry = AppConfig(
-                        key=key,
-                        value=value,
-                        description=description,
-                        is_secret=is_secret,
-                        category=category,
-                    )
-                    session.add(entry)
-                session.commit()
-
-            # Обновляем кэш после успешной записи
-            cls._cache[key] = (value, time.time())
-            logger.info("Настройка '%s' сохранена (category=%s)", key, category)
-        except Exception as e:
-            logger.error("Ошибка при сохранении настройки '%s': %s", key, e)
-            raise
-
-    # ------------------------------------------------------------------
-    # Типизированные геттеры
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def get_bool(cls, key: str, default: bool = False) -> bool:
-        """Получить булево значение настройки."""
-        val = cls.get(key)
-        if val is None:
             return default
-        return val.lower() in ("true", "1", "yes")
-
-    @classmethod
-    def get_int(cls, key: str, default: int = 0) -> int:
-        """Получить целочисленное значение настройки."""
-        val = cls.get(key)
-        if val is None:
-            return default
-        try:
-            return int(val)
-        except (ValueError, TypeError):
-            logger.warning(
-                "Невозможно преобразовать '%s' в int для ключа '%s', "
-                "используется default=%s",
-                val,
-                key,
-                default,
-            )
-            return default
-
-    # ------------------------------------------------------------------
-    # Кэш
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def clear_cache(cls) -> None:
-        """Очистить весь кэш настроек."""
-        cls._cache = {}
-        logger.debug("Кэш настроек очищен")
-
-    @classmethod
-    def invalidate(cls, key: str) -> None:
-        """Удалить конкретный ключ из кэша."""
-        cls._cache.pop(key, None)
-
-    # ------------------------------------------------------------------
-    # Массовые операции
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def get_all(cls, category: str | None = None) -> list[dict]:
-        """Получить все записи настроек, опционально фильтруя по категории.
-
-        Возвращает список словарей с полями:
-        ``key``, ``value``, ``description``, ``is_secret``, ``category``,
-        ``created_at``, ``updated_at``.
-        """
-        try:
-            with get_db_session() as session:
-                query = session.query(AppConfig)
-                if category is not None:
-                    query = query.filter(AppConfig.category == category)
-                entries = query.all()
-                result = [
-                    {
-                        "key": e.key,
-                        "value": e.value,
-                        "description": e.description,
-                        "is_secret": e.is_secret,
-                        "category": e.category,
-                        "created_at": (
-                            e.created_at.isoformat() if e.created_at else None
-                        ),
-                        "updated_at": (
-                            e.updated_at.isoformat() if e.updated_at else None
-                        ),
-                    }
-                    for e in entries
-                ]
-                return result
         except Exception as e:
-            logger.error("Ошибка при получении списка настроек: %s", e)
-            return []
-
+            logger.error(f"Error getting config {key}: {e}")
+            return default
+        finally:
+            db.close()
+    
     @classmethod
-    def delete(cls, key: str) -> bool:
-        """Удалить запись настройки из БД и кэша.
-
-        Возвращает ``True``, если запись была найдена и удалена.
-        """
+    def set(cls, key: str, value: str, description: Optional[str] = None,
+            is_secret: bool = False, category: str = 'general') -> bool:
+        """Установка значения настройки"""
+        db = get_db_session()
         try:
-            with get_db_session() as session:
-                entry = (
-                    session.query(AppConfig)
-                    .filter(AppConfig.key == key)
-                    .first()
+            config = db.query(AppConfig).filter(AppConfig.key == key).first()
+            if config:
+                config.value = value
+                config.description = description or config.description
+                config.is_secret = is_secret
+                config.category = category
+                config.updated_at = datetime.now()
+            else:
+                config = AppConfig(
+                    key=key,
+                    value=value,
+                    description=description,
+                    is_secret=is_secret,
+                    category=category
                 )
-                if entry is None:
-                    return False
-                session.delete(entry)
-                session.commit()
-
-            cls._cache.pop(key, None)
-            logger.info("Настройка '%s' удалена", key)
+                db.add(config)
+            
+            db.commit()
+            
+            # Обновляем кэш
+            cls._cache[key] = value
+            cls._cache_timestamp = datetime.now()
+            
             return True
         except Exception as e:
-            logger.error("Ошибка при удалении настройки '%s': %s", key, e)
+            logger.error(f"Error setting config {key}: {e}")
+            db.rollback()
             return False
-
-    # ------------------------------------------------------------------
-    # Режим открытого доступа (Auth Bypass)
-    # ------------------------------------------------------------------
-
+        finally:
+            db.close()
+    
     @classmethod
-    def is_auth_bypass_active(cls) -> bool:
-        """Проверить, активен ли режим открытого доступа.
-
-        Режим считается активным, если:
-        1. ``auth_bypass_enabled`` == ``'true'``
-        2. ``auth_bypass_until`` ещё не наступило
-
-        Если время действия истекло — режим автоматически отключается.
-        """
-        enabled = cls.get_bool("auth_bypass_enabled", default=False)
-        if not enabled:
-            return False
-
-        until_str = cls.get("auth_bypass_until")
-        if not until_str:
-            return False
-
+    def delete(cls, key: str) -> bool:
+        """Удаление настройки"""
+        db = get_db_session()
         try:
-            until_dt = datetime.fromisoformat(until_str)
-        except (ValueError, TypeError):
-            logger.warning(
-                "Некорректный формат auth_bypass_until: '%s'", until_str
-            )
+            config = db.query(AppConfig).filter(AppConfig.key == key).first()
+            if config:
+                db.delete(config)
+                db.commit()
+                
+                # Удаляем из кэша
+                if key in cls._cache:
+                    del cls._cache[key]
+                
+                return True
             return False
-
-        if datetime.now() >= until_dt:
-            # Время истекло — автоматически выключаем
-            logger.info("Режим открытого доступа истёк (%s), отключаю", until_str)
-            cls.set(
-                "auth_bypass_enabled",
-                "false",
-                description="Включён ли режим открытого доступа",
-                category="access",
-            )
-            cls.invalidate("auth_bypass_enabled")
-            cls.invalidate("auth_bypass_until")
+        except Exception as e:
+            logger.error(f"Error deleting config {key}: {e}")
+            db.rollback()
             return False
-
-        return True
-
+        finally:
+            db.close()
+    
     @classmethod
-    def get_auth_bypass_max_keys(cls) -> int:
-        """Получить лимит ключей для авто-активированных пользователей."""
-        return cls.get_int("auth_bypass_max_keys", default=1)
+    def get_all(cls, category: Optional[str] = None) -> List[Dict]:
+        """Получение всех настроек (для админ-панели)"""
+        db = get_db_session()
+        try:
+            query = db.query(AppConfig)
+            if category:
+                query = query.filter(AppConfig.category == category)
+            
+            configs = query.order_by(AppConfig.category, AppConfig.key).all()
+            
+            result = []
+            for config in configs:
+                result.append({
+                    'id': config.id,
+                    'key': config.key,
+                    'value': '***' if config.is_secret and config.value else config.value,
+                    'raw_value': config.value if not config.is_secret else None,
+                    'description': config.description,
+                    'is_secret': config.is_secret,
+                    'category': config.category,
+                    'updated_at': config.updated_at
+                })
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error getting all configs: {e}")
+            return []
+        finally:
+            db.close()
+    
+    @classmethod
+    def clear_cache(cls):
+        """Очистка кэша"""
+        cls._cache.clear()
+        cls._cache_timestamp = None
+
+
+# Глобальный экземпляр менеджера
+config_manager = ConfigManager()
+

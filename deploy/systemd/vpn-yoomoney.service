@@ -1,0 +1,28 @@
+[Unit]
+Description=VPN Bot YooMoney Web Server
+After=network.target
+
+[Service]
+Type=simple
+User=vpnbot
+Group=vpnbot
+WorkingDirectory=/opt/vpn-bot
+Environment="PATH=/usr/bin:/usr/local/bin"
+EnvironmentFile=/opt/vpn-bot/.env
+ExecStart=/usr/bin/python3 /opt/vpn-bot/start_yoomoney_server.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vpn-yoomoney
+
+# Безопасность
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/vpn-bot
+
+[Install]
+WantedBy=multi-user.target
+

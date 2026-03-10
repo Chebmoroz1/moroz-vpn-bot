@@ -1,47 +1,85 @@
-import React, { createContext, useContext, useEffect, useState } from "react";
+import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { authApi } from '../services/api';
 
-type AuthContextValue = {
+interface AuthContextType {
   token: string | null;
-  setToken: (t: string | null) => void;
+  isAuthenticated: boolean;
+  login: (token: string) => void;
+  logout: () => void;
+  verifyToken: () => Promise<boolean>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
 };
 
-const AuthContext = createContext<AuthContextValue | undefined>(undefined);
+interface AuthProviderProps {
+  children: ReactNode;
+}
 
-export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [token, setTokenState] = useState<string | null>(null);
+export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
+  const [token, setToken] = useState<string | null>(() => {
+    return localStorage.getItem('admin_token');
+  });
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const urlToken = params.get("token");
-    const stored = localStorage.getItem("auth_token");
-    const finalToken = urlToken || stored;
-    if (finalToken) {
-      setTokenState(finalToken);
-      localStorage.setItem("auth_token", finalToken);
+    if (token) {
+      verifyToken();
     }
-  }, []);
+  }, [token]);
 
-  const setToken = (t: string | null) => {
-    setTokenState(t);
-    if (t) {
-      localStorage.setItem("auth_token", t);
-    } else {
-      localStorage.removeItem("auth_token");
+  const verifyToken = async (): Promise<boolean> => {
+    if (!token) {
+      setIsAuthenticated(false);
+      return false;
+    }
+
+    try {
+      // Используем authApi, который автоматически добавит токен в query params
+      const response = await authApi.verify(token);
+      
+      if (response.data.valid) {
+        setIsAuthenticated(true);
+        return true;
+      } else {
+        logout();
+        return false;
+      }
+    } catch (error: any) {
+      console.error('Token verification failed:', error);
+      // Если ошибка 401 (неавторизован), не делаем logout, т.к. это может быть из-за неправильного URL
+      if (error?.response?.status === 401) {
+        logout();
+        return false;
+      }
+      // Для других ошибок (например, сетевые) не делаем logout
+      return false;
     }
   };
 
+  const login = (newToken: string) => {
+    setToken(newToken);
+    localStorage.setItem('admin_token', newToken);
+    setIsAuthenticated(true);
+  };
+
+  const logout = () => {
+    setToken(null);
+    localStorage.removeItem('admin_token');
+    setIsAuthenticated(false);
+  };
+
   return (
-    <AuthContext.Provider value={{ token, setToken }}>
+    <AuthContext.Provider value={{ token, isAuthenticated, login, logout, verifyToken }}>
       {children}
     </AuthContext.Provider>
   );
-};
-
-export const useAuth = (): AuthContextValue => {
-  const ctx = useContext(AuthContext);
-  if (!ctx) {
-    throw new Error("useAuth must be used within AuthProvider");
-  }
-  return ctx;
 };
 

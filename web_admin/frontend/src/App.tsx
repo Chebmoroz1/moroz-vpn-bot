@@ -1,33 +1,70 @@
-import React from "react";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import React, { useState, useEffect } from 'react';
+import { BrowserRouter as Router, Routes, Route, Navigate, useSearchParams } from 'react-router-dom';
+import './App.css';
+import Layout from './components/Layout';
+import Dashboard from './pages/Dashboard';
+import Users from './pages/Users';
+import Traffic from './pages/Traffic';
+import Keys from './pages/Keys';
+import Payments from './pages/Payments';
+import Login from './pages/Login';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
 
-import { DashboardPage } from "./pages/DashboardPage";
-import { UsersPage } from "./pages/UsersPage";
-import { KeysPage } from "./pages/KeysPage";
-import { TrafficPage } from "./pages/TrafficPage";
-import { MessagesPage } from "./pages/MessagesPage";
-import { SettingsPage } from "./pages/SettingsPage";
-import { LoginPage } from "./pages/LoginPage";
-import { AuthProvider } from "./contexts/AuthContext";
+function AppRoutes() {
+  const { isAuthenticated, token, login, verifyToken } = useAuth();
+  const [searchParams] = useSearchParams();
+  const [checkingToken, setCheckingToken] = useState(true);
+  
+  // Проверяем токен из URL при первой загрузке
+  useEffect(() => {
+    const checkUrlToken = async () => {
+      const urlToken = searchParams.get('token');
+      if (urlToken && !token) {
+        // Сохраняем токен из URL и проверяем его
+        login(urlToken);
+        const isValid = await verifyToken();
+        if (isValid) {
+          // Убираем token из URL
+          window.history.replaceState({}, '', window.location.pathname);
+        }
+      }
+      setCheckingToken(false);
+    };
+    
+    checkUrlToken();
+  }, [searchParams, token, login, verifyToken]);
 
-export const App: React.FC = () => {
+  if (checkingToken) {
+    return <div style={{ textAlign: 'center', padding: '50px' }}>Проверка авторизации...</div>;
+  }
+
+  if (!isAuthenticated) {
+    return <Login />;
+  }
+
   return (
-    <BrowserRouter>
-      <AuthProvider>
-        <Routes>
-          <Route path="/login" element={<LoginPage />} />
-          <Route path="/" element={<DashboardPage />} />
-          <Route path="/users" element={<UsersPage />} />
-          <Route path="/keys" element={<KeysPage />} />
-          <Route path="/traffic" element={<TrafficPage />} />
-          <Route path="/messages" element={<MessagesPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </AuthProvider>
-    </BrowserRouter>
+    <Layout>
+      <Routes>
+        <Route path="/" element={<Dashboard />} />
+        <Route path="/users" element={<Users />} />
+        <Route path="/traffic" element={<Traffic />} />
+        <Route path="/keys" element={<Keys />} />
+        <Route path="/payments" element={<Payments />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </Layout>
   );
-};
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <Router>
+        <AppRoutes />
+      </Router>
+    </AuthProvider>
+  );
+}
 
 export default App;
 

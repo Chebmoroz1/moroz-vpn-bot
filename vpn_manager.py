@@ -1,917 +1,905 @@
-"""
-VPN Manager module for MOROZ VPN Bot.
-
-Manages AmneziaWG keys via Docker exec on the SAME server (local mode only).
-Handles key generation, peer management, config file creation, and QR codes.
-"""
-
-import os
+"""Управление VPN (AmneziaWG через SSH/Docker)"""
 import subprocess
-import logging
-import asyncio
+import secrets
 import ipaddress
 import re
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import socket
 from pathlib import Path
-import base64
-import struct
-import zlib
-
-import qrcode
-from PIL import Image
-
+from typing import Optional, Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from paramiko import SSHClient, AutoAddPolicy
 from config import (
-    SERVER_HOST, VPN_PORT, VPN_DOCKER_CONTAINER, VPN_INTERFACE,
-    VPN_PROTOCOL, VPN_CONFIGS_DIR, VPN_NETWORK, VPN_CONFIG_PATH
+    SERVER_HOST, SERVER_USER, SERVER_SSH_KEY,
+    VPN_CONFIGS_DIR, VPN_PORT, VPN_NETWORK, VPN_DOCKER_CONTAINER, VPN_INTERFACE
 )
-from database import get_db_session, VPNKey, User
+import logging
 
 logger = logging.getLogger(__name__)
 
 
 class VPNManager:
-    """
-    Manages AmneziaWG VPN keys and peers via Docker exec commands
-    on the local server. No SSH required — all operations are performed
-    through ``docker exec`` against the running container.
-    """
+    """Менеджер для управления VPN через SSH/Docker"""
 
     def __init__(self):
-        self._executor = ThreadPoolExecutor(max_workers=5)
-        logger.info(
-            "VPNManager initialized — container=%s, interface=%s, network=%s",
-            VPN_DOCKER_CONTAINER, VPN_INTERFACE, VPN_NETWORK,
-        )
-
-    # ──────────────────────────────────────────────
-    # Docker command helpers
-    # ──────────────────────────────────────────────
-
-    def _run_docker_cmd(self, cmd: str) -> str:
+        self.server_host = SERVER_HOST
+        self.server_user = SERVER_USER
+        self.ssh_key = SERVER_SSH_KEY
+        self.docker_container = VPN_DOCKER_CONTAINER
+        self.vpn_interface = VPN_INTERFACE
+        self.vpn_port = VPN_PORT
+        self.vpn_network = ipaddress.ip_network(VPN_NETWORK, strict=False)
+        self.wg_path = "/usr/bin/wg"  # Полный путь к wg внутри Docker контейнера
+        
+        # Определяем, работаем ли мы локально (на том же сервере)
+        self.is_local = self._is_local_server()
+        
+        # ThreadPoolExecutor для выполнения блокирующих операций
+        self.executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="vpn_exec")
+        
+        if self.is_local:
+            logger.info("✅ VPN Manager: Используется прямой доступ к Docker (локальный режим) - быстрее и эффективнее")
+        else:
+            logger.info(f"✅ VPN Manager: Используется SSH доступ к {self.server_host} (удаленный режим)")
+    
+    def _is_local_server(self) -> bool:
         """
-        Run a command inside the VPN Docker container synchronously.
-
-        Parameters
-        ----------
-        cmd : str
-            Command to execute inside the container.
-
-        Returns
-        -------
-        str
-            Stripped stdout of the executed command.
-
-        Raises
-        ------
-        subprocess.CalledProcessError
-            If the command exits with a non-zero return code.
+        Проверяет, работает ли бот на том же сервере, что и VPN
+        Если да - используем прямой docker exec вместо SSH (намного быстрее!)
         """
-        full_cmd = f"docker exec {VPN_DOCKER_CONTAINER} {cmd}"
-        logger.debug("Running docker cmd: %s", full_cmd)
+        try:
+            # Получаем IP адрес текущего хоста
+            hostname = socket.gethostname()
+            try:
+                local_ip = socket.gethostbyname(hostname)
+            except socket.gaierror:
+                local_ip = None
+            
+            # Проверяем различные варианты локальных адресов
+            local_ips = ['127.0.0.1', 'localhost', '::1']
+            if local_ip:
+                local_ips.append(local_ip)
+            
+            # Если SERVER_HOST указывает на локальный адрес
+            if self.server_host in local_ips:
+                logger.debug(f"Определен локальный режим: SERVER_HOST={self.server_host} в списке локальных адресов")
+                return True
+            
+            # Проверяем, можем ли мы выполнить docker команду напрямую
+            # Если контейнер доступен локально - значит мы на том же хосте
+            try:
+                result = subprocess.run(
+                    ['docker', 'ps', '--filter', f'name={self.docker_container}', '--format', '{{.Names}}'],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0 and self.docker_container in result.stdout:
+                    logger.debug(f"Определен локальный режим: Docker контейнер {self.docker_container} доступен локально")
+                    return True
+            except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError) as e:
+                logger.debug(f"Docker команда недоступна локально: {e}")
+            
+            # Если ничего не подошло - используем SSH
+            return False
+        except Exception as e:
+            logger.warning(f"Не удалось определить, локальный ли сервер: {e}. Используется SSH режим.")
+            return False
 
-        result = subprocess.run(
-            full_cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        if result.returncode != 0:
-            logger.error(
-                "Docker cmd failed (rc=%d): %s\nstderr: %s",
-                result.returncode, full_cmd, result.stderr.strip(),
+    def _docker_exec_local(self, command: str) -> Tuple[str, str, int]:
+        """
+        Прямое выполнение команды в Docker контейнере (локальный режим)
+        Намного быстрее, чем SSH, так как нет overhead на шифрование и аутентификацию
+        :param command: Команда для выполнения
+        :return: (stdout, stderr, exit_code)
+        """
+        try:
+            # Экранируем команду для безопасной передачи
+            escaped_command = command.replace('"', '\\"')
+            full_command = ['docker', 'exec', self.docker_container, 'sh', '-c', escaped_command]
+            
+            logger.debug(f"Executing local docker command: {' '.join(full_command)}")
+            
+            result = subprocess.run(
+                full_command,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False
             )
-            raise subprocess.CalledProcessError(
-                result.returncode, full_cmd,
-                output=result.stdout, stderr=result.stderr,
+            
+            if result.returncode != 0:
+                logger.warning(f"Command failed with exit code {result.returncode}: {result.stderr}")
+            
+            return result.stdout, result.stderr, result.returncode
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f"Docker command timeout: {command}")
+            return "", "Command timeout", 1
+        except FileNotFoundError:
+            logger.error("Docker command not found. Is Docker installed?")
+            return "", "Docker not found", 1
+        except Exception as e:
+            logger.error(f"Docker exec error: {e}", exc_info=True)
+            return "", str(e), 1
+
+    def _ssh_exec(self, command: str, docker_exec: bool = False) -> Tuple[str, str, int]:
+        """
+        Выполнение команды через SSH (для удаленного доступа)
+        :param command: Команда для выполнения
+        :param docker_exec: Если True, команда выполняется внутри Docker контейнера
+        :return: (stdout, stderr, exit_code)
+        """
+        try:
+            ssh = SSHClient()
+            ssh.set_missing_host_key_policy(AutoAddPolicy())
+            
+            # Проверяем существование SSH ключа
+            ssh_key_path = Path(self.ssh_key).expanduser()
+            if not ssh_key_path.exists():
+                error_msg = f"SSH ключ не найден: {ssh_key_path}"
+                logger.error(error_msg)
+                raise FileNotFoundError(error_msg)
+            
+            logger.debug(f"Connecting to {self.server_user}@{self.server_host} using key {ssh_key_path}")
+            
+            ssh.connect(
+                hostname=self.server_host,
+                username=self.server_user,
+                key_filename=str(ssh_key_path),
+                timeout=10,
+                look_for_keys=False,
+                allow_agent=False
             )
 
-        return result.stdout.strip()
+            if docker_exec:
+                # Используем sh -c с двойными кавычками для правильного выполнения команды внутри контейнера
+                escaped_command = command.replace('"', '\\"')
+                full_command = f'docker exec {self.docker_container} sh -c "{escaped_command}"'
+            else:
+                full_command = command
 
-    async def _async_docker_cmd(self, cmd: str) -> str:
-        """
-        Run a Docker exec command asynchronously via the thread-pool executor.
+            logger.debug(f"Executing SSH command: {full_command}")
+            stdin, stdout, stderr = ssh.exec_command(full_command)
+            exit_code = stdout.channel.recv_exit_status()
+            stdout_text = stdout.read().decode('utf-8')
+            stderr_text = stderr.read().decode('utf-8')
 
-        Parameters
-        ----------
-        cmd : str
-            Command to execute inside the container.
+            if exit_code != 0:
+                logger.warning(f"Command failed with exit code {exit_code}: {stderr_text}")
 
-        Returns
-        -------
-        str
-            Stripped stdout of the executed command.
-        """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self._executor, self._run_docker_cmd, cmd)
+            ssh.close()
+            return stdout_text, stderr_text, exit_code
 
-    # ──────────────────────────────────────────────
-    # Server introspection
-    # ──────────────────────────────────────────────
-
-    async def get_server_public_key(self) -> str:
-        """
-        Retrieve the server's WireGuard public key from the running interface.
-
-        Returns
-        -------
-        str
-            The server public key (base64).
-        """
-        try:
-            pub_key = await self._async_docker_cmd(f"wg show {VPN_INTERFACE} public-key")
-            logger.info("Server public key: %s", pub_key)
-            return pub_key
+        except FileNotFoundError as e:
+            logger.error(f"SSH key not found: {e}")
+            return "", str(e), 1
         except Exception as e:
-            logger.error("Failed to get server public key: %s", e)
-            raise
-
-    async def get_server_obfuscation_params(self) -> dict:
+            logger.error(f"SSH exec error: {e}", exc_info=True)
+            error_msg = f"Ошибка SSH подключения: {str(e)}"
+            return "", error_msg, 1
+    
+    def _exec_command(self, command: str, docker_exec: bool = False) -> Tuple[str, str, int]:
         """
-        Parse AmneziaWG obfuscation parameters from the wg0.conf inside
-        the Amnezia container.
-
-        We intentionally read from the config file (/opt/amnezia/awg/wg0.conf)
-        instead of relying on ``wg show wg0 dump`` to ensure that the
-        client config matches exactly what Amnezia generated originally.
-
-        Returns
-        -------
-        dict
-            Keys: Jc, Jmin, Jmax, S1, S2, H1, H2, H3, H4 (all as strings).
+        Универсальный метод выполнения команды
+        Автоматически выбирает локальный (docker exec) или SSH режим
+        :param command: Команда для выполнения
+        :param docker_exec: Если True, команда выполняется внутри Docker контейнера
+        :return: (stdout, stderr, exit_code)
         """
+        if docker_exec and self.is_local:
+            # Используем прямой доступ к Docker (быстрее!)
+            return self._docker_exec_local(command)
+        else:
+            # Используем SSH (для удаленного доступа или локальных команд)
+            return self._ssh_exec(command, docker_exec)
+
+    def _generate_wg_keys(self) -> Tuple[str, str]:
+        """Генерация пары ключей WireGuard"""
         try:
-            cfg = await self._async_docker_cmd(f"cat {VPN_CONFIG_PATH}")
-            params: dict[str, str] = {}
-            for line in cfg.splitlines():
-                line = line.strip()
-                if not line or "=" not in line:
-                    continue
-                key, value = [p.strip() for p in line.split("=", 1)]
-                if key in {"Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"}:
-                    params[key] = value
+            # Пробуем использовать локальные команды wg
+            logger.debug("Attempting to generate keys locally using wg command")
+            private_key = subprocess.run(
+                ["wg", "genkey"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=5
+            ).stdout.strip()
 
-            # Basic sanity: fall back to zeros if something is missing
-            for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
-                params.setdefault(k, "0")
+            public_key = subprocess.run(
+                ["wg", "pubkey"],
+                input=private_key,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=5
+            ).stdout.strip()
 
-            logger.info("Server obfuscation params (from config): %s", params)
-            return params
+            logger.info("Keys generated successfully using local wg command")
+            return private_key, public_key
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+            # Если wg не установлен локально, генерируем через сервер
+            logger.info(f"Local wg command not available ({e}), using server-side generation")
+            return self._generate_wg_keys_via_server()
 
-        except Exception as e:
-            logger.error("Failed to get obfuscation params from %s: %s", VPN_CONFIG_PATH, e)
-            # Fallback to zeros so that config generation still works
-            return {
-                "Jc": "0",
-                "Jmin": "0",
-                "Jmax": "0",
-                "S1": "0",
-                "S2": "0",
-                "H1": "0",
-                "H2": "0",
-                "H3": "0",
-                "H4": "0",
-            }
+    def _generate_wg_keys_via_server(self) -> Tuple[str, str]:
+        """Генерация ключей через сервер"""
+        logger.info("Generating WireGuard keys via server")
+        
+        # Используем путь по умолчанию (проверено, что он работает)
+        wg_path = self.wg_path
+        
+        # Генерируем приватный ключ
+        logger.debug("Generating private key")
+        stdout, stderr, exit_code = self._exec_command(f"{wg_path} genkey", docker_exec=True)
+        if exit_code != 0:
+            error_msg = f"Failed to generate private key on server: {stderr}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
 
-    # ──────────────────────────────────────────────
-    # IP address management
-    # ──────────────────────────────────────────────
+        private_key = stdout.strip()
+        if not private_key:
+            error_msg = "Private key is empty"
+            logger.error(error_msg)
+            raise Exception(error_msg)
 
-    async def get_used_ips(self) -> set[str]:
-        """
-        Collect all IP addresses currently assigned to peers on the interface.
+        logger.debug(f"Private key generated: {private_key[:20]}...")
 
-        Returns
-        -------
-        set[str]
-            Set of IP addresses (without CIDR suffix) already in use.
-        """
-        used_ips: set[str] = set()
-        try:
-            dump = await self._async_docker_cmd(f"wg show {VPN_INTERFACE} dump")
-            lines = dump.strip().split("\n")
+        # Получаем публичный ключ из приватного через stdin
+        logger.debug("Generating public key from private key via stdin")
+        
+        if self.is_local:
+            # Локальный режим: используем subprocess напрямую
+            try:
+                full_command = ['docker', 'exec', '-i', self.docker_container, wg_path, 'pubkey']
+                logger.debug(f"Executing local docker command with stdin: {' '.join(full_command)}")
+                
+                process = subprocess.Popen(
+                    full_command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                
+                public_key_stdout, public_key_stderr = process.communicate(input=private_key, timeout=10)
+                public_key_exit_code = process.returncode
+                
+            except subprocess.TimeoutExpired:
+                process.kill()
+                error_msg = "Timeout when generating public key"
+                logger.error(error_msg)
+                raise Exception(error_msg)
+            except Exception as e:
+                error_msg = f"Error when generating public key: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                raise Exception(error_msg)
+        else:
+            # Удаленный режим: используем SSH
+            ssh = SSHClient()
+            ssh.set_missing_host_key_policy(AutoAddPolicy())
+            
+            ssh_key_path = Path(self.ssh_key).expanduser()
+            ssh.connect(
+                hostname=self.server_host,
+                username=self.server_user,
+                key_filename=str(ssh_key_path),
+                timeout=10,
+                look_for_keys=False,
+                allow_agent=False
+            )
+            
+            try:
+                # Формируем команду для выполнения внутри Docker контейнера
+                # Используем docker exec -i для передачи stdin
+                full_command = f'docker exec -i {self.docker_container} {wg_path} pubkey'
+                
+                logger.debug(f"Executing SSH command with stdin: {full_command}")
+                stdin, stdout, stderr = ssh.exec_command(full_command)
+                
+                # Передаем приватный ключ через stdin
+                # Важно: передаем как байты и закрываем stdin после записи
+                stdin.write(private_key.encode('utf-8'))
+                stdin.flush()
+                stdin.channel.shutdown_write()
+                
+                exit_code = stdout.channel.recv_exit_status()
+                public_key_stdout = stdout.read().decode('utf-8')
+                public_key_stderr = stderr.read().decode('utf-8')
+                
+                public_key_exit_code = exit_code
+                
+            except Exception as e:
+                error_msg = f"SSH error when generating public key: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                raise Exception(error_msg)
+            finally:
+                ssh.close()
 
-            # Skip the first line (interface), remaining lines are peers.
-            # Peer format: public_key  preshared_key  endpoint  allowed_ips  latest_handshake  transfer_rx  transfer_tx  persistent_keepalive  ...
-            for line in lines[1:]:
-                parts = line.split("\t")
-                if len(parts) >= 4:
-                    allowed_ips = parts[3]  # e.g. "10.8.1.2/32"
-                    for cidr in allowed_ips.split(","):
-                        cidr = cidr.strip()
-                        if cidr and cidr != "(none)":
-                            ip = cidr.split("/")[0]
-                            used_ips.add(ip)
+        if public_key_exit_code != 0:
+            error_msg = f"Failed to generate public key on server: {public_key_stderr}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
 
-            logger.debug("Used IPs on server: %s", used_ips)
-        except Exception as e:
-            logger.error("Failed to get used IPs: %s", e)
+        public_key = public_key_stdout.strip()
+        if not public_key:
+            error_msg = "Public key is empty"
+            logger.error(error_msg)
+            raise Exception(error_msg)
 
-        return used_ips
+        logger.debug(f"Public key generated: {public_key[:20]}...")
 
-    async def get_next_ip(self) -> str:
-        """
-        Find the next available IP address in the VPN subnet.
+        logger.info(f"Keys generated successfully via server. Public key: {public_key[:20]}...")
+        return private_key, public_key
 
-        Iterates from .2 upward within ``VPN_NETWORK``, skipping the
-        network address, broadcast address, gateway (.1), and any
-        addresses already assigned to peers.
+    def get_server_public_key(self) -> Optional[str]:
+        """Получение публичного ключа сервера"""
+        logger.info(f"Getting server public key from interface {self.vpn_interface}")
+        stdout, stderr, exit_code = self._exec_command(f"{self.wg_path} show {self.vpn_interface} public-key", docker_exec=True)
+        
+        if exit_code != 0:
+            logger.error(f"Failed to get server public key. Exit code: {exit_code}, Stderr: {stderr}")
+            # Попробуем альтернативный способ
+            stdout2, stderr2, exit_code2 = self._exec_command(f"{self.wg_path} show {self.vpn_interface} dump", docker_exec=True)
+            if exit_code2 == 0 and stdout2:
+                # Публичный ключ сервера - первое поле в первой строке dump
+                lines = stdout2.strip().split('\n')
+                if lines:
+                    parts = lines[0].split('\t')
+                    if len(parts) > 0:
+                        return parts[0]
+            raise Exception(f"Не удалось получить публичный ключ сервера: {stderr}")
+        
+        if stdout.strip():
+            return stdout.strip()
+        
+        raise Exception("Публичный ключ сервера пустой")
 
-        Returns
-        -------
-        str
-            The next free IP address.
+    def get_server_endpoint(self) -> str:
+        """Получение endpoint сервера"""
+        return f"{self.server_host}:{self.vpn_port}"
 
-        Raises
-        ------
-        RuntimeError
-            If no free addresses remain in the subnet.
-        """
-        used_ips = await self.get_used_ips()
-        network = ipaddress.IPv4Network(VPN_NETWORK, strict=False)
+    def get_next_available_ip(self) -> Optional[str]:
+        """Получение следующего доступного IP адреса"""
+        # Получаем список используемых IP
+        stdout, stderr, exit_code = self._exec_command(f"{self.wg_path} show {self.vpn_interface} dump", docker_exec=True)
+        
+        used_ips = set()
+        if exit_code == 0:
+            for line in stdout.strip().split('\n'):
+                if line:
+                    parts = line.split('\t')
+                    if len(parts) >= 4:
+                        allowed_ips = parts[3]
+                        # Извлекаем IP из allowed_ips (формат: 10.8.1.X/32)
+                        ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', allowed_ips)
+                        if ip_match:
+                            used_ips.add(ip_match.group(1))
 
-        for host in network.hosts():
+        # Находим свободный IP (начинаем с 10.8.1.2, т.к. 10.8.1.0/24 - это сеть, 10.8.1.1 обычно шлюз)
+        for host in self.vpn_network.hosts():
             ip_str = str(host)
-            # Skip .0 (network) and .1 (gateway / server)
-            if ip_str.endswith(".0") or ip_str.endswith(".1"):
+            # Пропускаем первые несколько адресов (0, 1 обычно зарезервированы)
+            if ip_str.split('.')[-1] in ['0', '1']:
                 continue
             if ip_str not in used_ips:
-                logger.info("Next available IP: %s", ip_str)
                 return ip_str
 
-        raise RuntimeError(f"No free IP addresses in {VPN_NETWORK}")
+        return None
 
-    # ──────────────────────────────────────────────
-    # Key generation
-    # ──────────────────────────────────────────────
-
-    async def generate_keys(self) -> tuple[str, str]:
+    def add_peer(self, public_key: str, allowed_ips: str, preshared_key: Optional[str] = None) -> bool:
         """
-        Generate a WireGuard private/public key pair inside the container.
-
-        Returns
-        -------
-        tuple[str, str]
-            ``(private_key, public_key)`` as base64-encoded strings.
+        Добавление peer на сервер
+        :param public_key: Публичный ключ клиента
+        :param allowed_ips: Разрешенные IP адреса (например, 10.8.1.2/32)
+        :param preshared_key: Pre-shared key (опционально)
+        :return: True если успешно
         """
-        try:
-            private_key = await self._async_docker_cmd("wg genkey")
-            public_key = await self._async_docker_cmd(
-                f"bash -c 'echo {private_key} | wg pubkey'"
-            )
-            logger.info("Generated key pair — public_key=%s", public_key)
-            return private_key, public_key
-        except Exception as e:
-            logger.error("Failed to generate keys: %s", e)
-            raise
-
-    # ──────────────────────────────────────────────
-    # Peer management
-    # ──────────────────────────────────────────────
-
-    async def add_peer(
-        self,
-        public_key: str,
-        private_key: str,
-        client_ip: str,
-    ) -> dict | None:
-        """
-        Add a new peer to the running WireGuard interface and persist the config.
-
-        Parameters
-        ----------
-        public_key : str
-            Client public key (base64).
-        private_key : str
-            Client private key (base64). Not used on the server directly but
-            returned for convenience so the caller has a full key bundle.
-        client_ip : str
-            Client tunnel IP address (without CIDR).
-
-        Returns
-        -------
-        dict | None
-            On success, a dict with keys:
-
-            ``public_key``, ``private_key``, ``preshared_key``, ``client_ip``.
-            Returns ``None`` on error or if a duplicate is detected.
-        """
-        try:
-            # Fetch current peers to prevent duplicates by public_key or IP.
-            dump = await self._async_docker_cmd(f"wg show {VPN_INTERFACE} dump")
-            lines = dump.strip().split("\n")
-
-            existing_pubkeys: set[str] = set()
-            used_ips: set[str] = set()
-
-            for line in lines[1:]:
-                parts = line.split("\t")
-                if len(parts) < 4:
-                    continue
-                existing_pubkeys.add(parts[0])
-                allowed_ips = parts[3]
-                for cidr in allowed_ips.split(","):
-                    cidr = cidr.strip()
-                    if cidr and cidr != "(none)":
-                        ip = cidr.split("/")[0]
-                        used_ips.add(ip)
-
-            if public_key in existing_pubkeys:
-                logger.error(
-                    "Refusing to add peer: public_key already exists on %s: %s",
-                    VPN_INTERFACE,
-                    public_key,
-                )
-                return None
-
-            if client_ip in used_ips:
-                logger.error(
-                    "Refusing to add peer: IP %s already in use on %s",
-                    client_ip,
-                    VPN_INTERFACE,
-                )
-                return None
-
-            # Add peer without PresharedKey (same as working vpn-bot with same Amnezia version).
-            # PSK is optional in WireGuard; omitting it avoids persistence/race issues in the container.
-            await self._async_docker_cmd(
-                f"wg set {VPN_INTERFACE} peer {public_key} allowed-ips {client_ip}/32"
-            )
-
-            # Persist the full, canonical config generated by Amnezia/WireGuard
-            # instead of manually appending [Peer] blocks.
-            await self._async_docker_cmd(
-                f"bash -c 'wg showconf {VPN_INTERFACE} > {VPN_CONFIG_PATH}'"
-            )
-
-            # Verify the peer was actually added and has the expected AllowedIPs.
-            dump_after = await self._async_docker_cmd(f"wg show {VPN_INTERFACE} dump")
-            peer_found = False
-            for line in dump_after.strip().split("\n")[1:]:
-                parts = line.split("\t")
-                if len(parts) < 4:
-                    continue
-                if parts[0] != public_key:
-                    continue
-                peer_found = True
-                allowed_ips = parts[3]
-                if f"{client_ip}/32" not in [c.strip() for c in allowed_ips.split(",")]:
-                    logger.error(
-                        "Peer %s added but missing expected AllowedIPs %s/32 (got: %s)",
-                        public_key,
-                        client_ip,
-                        allowed_ips,
-                    )
-                    return None
-                break
-
-            if not peer_found:
-                logger.error(
-                    "Peer NOT found after add — public_key=%s, ip=%s",
-                    public_key,
-                    client_ip,
-                )
-                return None
-
-            logger.info("Peer added successfully: %s (%s)", public_key, client_ip)
-            return {
-                "public_key": public_key,
-                "private_key": private_key,
-                "preshared_key": None,
-                "client_ip": client_ip,
-            }
-
-        except Exception as e:
-            logger.error("Failed to add peer %s: %s", public_key, e, exc_info=True)
-            return None
-
-    async def remove_peer(self, public_key: str) -> bool:
-        """
-        Remove a peer from the running WireGuard interface and persist the config.
-
-        Parameters
-        ----------
-        public_key : str
-            Client public key (base64).
-
-        Returns
-        -------
-        bool
-            ``True`` if the peer was successfully removed.
-        """
-        try:
-            await self._async_docker_cmd(
-                f"wg set {VPN_INTERFACE} peer {public_key} remove"
-            )
-            # Persist the updated config to the AmneziaWG config file.
-            await self._async_docker_cmd(
-                f"bash -c 'wg showconf {VPN_INTERFACE} > {VPN_CONFIG_PATH}'"
-            )
-            logger.info("Peer removed: %s", public_key)
-            return True
-        except Exception as e:
-            logger.error("Failed to remove peer %s: %s", public_key, e)
-            return False
-
-    # ──────────────────────────────────────────────
-    # Config generation
-    # ──────────────────────────────────────────────
-
-    def generate_config(
-        self,
-        private_key: str,
-        client_ip: str,
-        server_public_key: str,
-        obfuscation_params: dict,
-        preshared_key: str | None = None,
-    ) -> str:
-        """
-        Generate an AmneziaWG client ``.conf`` file content.
-
-        Parameters
-        ----------
-        private_key : str
-            Client private key (base64).
-        client_ip : str
-            Client tunnel IP address.
-        server_public_key : str
-            Server public key (base64).
-        obfuscation_params : dict
-            AmneziaWG obfuscation parameters (Jc, Jmin, Jmax, S1, S2, H1–H4).
-
-        Returns
-        -------
-        str
-            Complete WireGuard/AmneziaWG ``.conf`` file content.
-        """
-        config = (
-            f"[Interface]\n"
-            f"PrivateKey = {private_key}\n"
-            f"Address = {client_ip}/32\n"
-            f"DNS = 1.1.1.1, 1.0.0.1\n"
-            f"Jc = {obfuscation_params['Jc']}\n"
-            f"Jmin = {obfuscation_params['Jmin']}\n"
-            f"Jmax = {obfuscation_params['Jmax']}\n"
-            f"S1 = {obfuscation_params['S1']}\n"
-            f"S2 = {obfuscation_params['S2']}\n"
-            f"H1 = {obfuscation_params['H1']}\n"
-            f"H2 = {obfuscation_params['H2']}\n"
-            f"H3 = {obfuscation_params['H3']}\n"
-            f"H4 = {obfuscation_params['H4']}\n"
-            f"\n"
-            f"[Peer]\n"
-            f"PublicKey = {server_public_key}\n"
-            f"Endpoint = {SERVER_HOST}:{VPN_PORT}\n"
-        )
-
+        # Базовая команда для добавления peer
         if preshared_key:
-            config += f"PresharedKey = {preshared_key}\n"
+            # Для pre-shared key используем временный файл
+            command = (
+                f"echo '{preshared_key}' | "
+                f"{self.wg_path} set {self.vpn_interface} peer {public_key} allowed-ips {allowed_ips} preshared-key /dev/stdin"
+            )
+        else:
+            command = f"{self.wg_path} set {self.vpn_interface} peer {public_key} allowed-ips {allowed_ips}"
+        
+        stdout, stderr, exit_code = self._exec_command(command, docker_exec=True)
+        
+        if exit_code == 0:
+            logger.info(f"Peer added successfully via wg set")
+            
+            # Для AmneziaWG конфигурация может сохраняться автоматически
+            # Но можно попробовать явно сохранить через wg-quick (если доступен)
+            # Ошибка сохранения не критична, так как для AmneziaWG wg set достаточно
+            save_command = f"wg-quick save {self.vpn_interface} 2>/dev/null || true"
+            save_stdout, save_stderr, save_exit = self._ssh_exec(save_command, docker_exec=True)
+            
+            if save_exit == 0:
+                logger.info("Configuration saved via wg-quick")
+            else:
+                logger.debug(f"wg-quick save not available (expected for AmneziaWG): {save_stderr}")
+            
+            # Проверяем, что peer действительно добавлен
+            verify_stdout, verify_stderr, verify_exit = self._ssh_exec(
+                f"{self.wg_path} show {self.vpn_interface} dump", docker_exec=True
+            )
+            if verify_exit == 0 and public_key in verify_stdout:
+                logger.info(f"✅ Verified: peer {public_key[:30]}... is present on server")
+            else:
+                logger.warning(f"⚠️ Warning: peer {public_key[:30]}... not found in dump after addition")
+            
+            return True
+        
+        logger.error(f"Failed to add peer: {stderr}")
+        return False
 
-        config += (
-            f"AllowedIPs = 0.0.0.0/0, ::/0\n"
-            f"PersistentKeepalive = 25\n"
-        )
+    def remove_peer(self, public_key: str) -> bool:
+        """Удаление peer с сервера"""
+        command = f"{self.wg_path} set {self.vpn_interface} peer {public_key} remove"
+        stdout, stderr, exit_code = self._exec_command(command, docker_exec=True)
+        
+        if exit_code == 0:
+            # Сохраняем конфигурацию WireGuard
+            save_command = f"wg-quick save {self.vpn_interface}"
+            self._ssh_exec(save_command, docker_exec=True)
+            return True
+        
+        logger.error(f"Failed to remove peer: {stderr}")
+        return False
+
+    def generate_config(self, private_key: str, client_ip: str, server_public_key: str) -> str:
+        """Генерация конфигурационного файла AmneziaWG"""
+        config = f"""[Interface]
+PrivateKey = {private_key}
+Address = {client_ip}/32
+DNS = 1.1.1.1, 8.8.8.8
+
+[Peer]
+PublicKey = {server_public_key}
+Endpoint = {self.get_server_endpoint()}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+"""
         return config
 
-    def generate_vpn_text_key(self, config_content: str) -> str:
+    def save_config_file(self, key_name: str, config_content: str, overwrite: bool = False) -> Path:
         """
-        Generate a vpn://-style text key for Amnezia-compatible clients.
-
-        The exact internal format of Amnezia's vpn:// keys is not fully
-        documented publicly, but it is known that they are based on a
-        zlib-compressed payload encoded with URL-safe base64 using a
-        Qt-style qCompress header (4-byte big-endian length prefix).
-
-        Here we treat the generated WireGuard/AmneziaWG config text as
-        the payload, compress it accordingly, and return a shareable
-        ``vpn://...`` string that clients can import as a text key.
+        Сохранение конфигурационного файла
+        
+        Args:
+            key_name: Имя ключа
+            config_content: Содержимое конфигурации
+            overwrite: Перезаписывать существующий файл (по умолчанию False для защиты)
+        
+        Returns:
+            Path к файлу конфигурации
         """
-        data = config_content.encode("utf-8")
-        header = struct.pack(">I", len(data))
-        compressed = zlib.compress(data, level=9)
-        payload = header + compressed
-        b64 = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-        return f"vpn://{b64}"
-
-    def save_config_file(self, config_content: str, key_name: str) -> str:
-        """
-        Save a client config to a ``.conf`` file on disk.
-
-        Parameters
-        ----------
-        config_content : str
-            Full config file content.
-        key_name : str
-            Unique key name used as the filename stem.
-
-        Returns
-        -------
-        str
-            Absolute path to the saved file.
-        """
-        os.makedirs(VPN_CONFIGS_DIR, exist_ok=True)
-        file_path = os.path.join(VPN_CONFIGS_DIR, f"{key_name}.conf")
-
-        with open(file_path, "w", encoding="utf-8") as f:
+        config_path = VPN_CONFIGS_DIR / f"{key_name}.conf"
+        
+        # Защита от перезаписи: если файл существует и overwrite=False, сохраняем существующий
+        if config_path.exists() and not overwrite:
+            logger.info(f"Config file already exists, preserving existing config: {config_path}")
+            logger.info(f"Existing config will not be overwritten. To overwrite, use overwrite=True")
+            return config_path
+        
+        # Записать или перезаписать файл
+        with open(config_path, 'w', encoding='utf-8') as f:
             f.write(config_content)
+        
+        logger.info(f"Config file {'created' if not config_path.exists() else 'updated'}: {config_path}")
+        return config_path
 
-        logger.info("Config saved: %s", file_path)
-        return file_path
+    def generate_qr_code(self, key_name: str, config_path: Path) -> Optional[Path]:
+        """Генерация QR-кода из конфигурационного файла"""
+        try:
+            import qrcode
+            from PIL import Image
 
-    def generate_qr_code(self, config_content: str, key_name: str) -> str:
+            # Читаем конфигурацию
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config_content = f.read()
+
+            # Генерируем QR-код
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(config_content)
+            qr.make(fit=True)
+
+            img = qr.make_image(fill_color="black", back_color="white")
+            qr_path = VPN_CONFIGS_DIR / f"{key_name}.png"
+            img.save(qr_path)
+            return qr_path
+
+        except Exception as e:
+            logger.error(f"Failed to generate QR code: {e}")
+            return None
+
+    def create_vpn_key(self, user_id: int, key_name: str) -> Optional[Dict]:
         """
-        Generate a QR-code PNG image from the config content.
-
-        Parameters
-        ----------
-        config_content : str
-            Full config file content to encode.
-        key_name : str
-            Unique key name used as the filename stem.
-
-        Returns
-        -------
-        str
-            Absolute path to the saved PNG file.
-        """
-        os.makedirs(VPN_CONFIGS_DIR, exist_ok=True)
-        qr_path = os.path.join(VPN_CONFIGS_DIR, f"{key_name}.png")
-
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=4,
-        )
-        qr.add_data(config_content)
-        qr.make(fit=True)
-
-        img: Image.Image = qr.make_image(fill_color="black", back_color="white")
-        img.save(qr_path)
-
-        logger.info("QR code saved: %s", qr_path)
-        return qr_path
-
-    # ──────────────────────────────────────────────
-    # Key naming
-    # ──────────────────────────────────────────────
-
-    def generate_key_name(self, user: User) -> str:
-        """
-        Generate a unique, filesystem-safe key name from user information.
-
-        Format: ``{first_name}_{phone_part}_{datetime}_{telegram_id}``
-
-        Parameters
-        ----------
-        user : User
-            Database user object.
-
-        Returns
-        -------
-        str
-            Sanitized key name, max 60 characters.
-        """
-        first_name = (user.first_name or "user").strip()
-        phone = (user.phone_number or "nophone").strip()
-        telegram_id = str(user.telegram_id or 0)
-        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        # Sanitize: replace spaces with _, '+' with 'plus', drop non-alnum/_
-        def sanitize(s: str) -> str:
-            s = s.replace(" ", "_")
-            s = s.replace("+", "plus")
-            s = re.sub(r"[^a-zA-Z0-9_]", "", s)
-            return s
-
-        first_name = sanitize(first_name)
-        phone_part = sanitize(phone)
-        telegram_id = sanitize(telegram_id)
-
-        key_name = f"{first_name}_{phone_part}_{now}_{telegram_id}"
-
-        # Truncate to 60 characters
-        if len(key_name) > 60:
-            key_name = key_name[:60]
-
-        logger.debug("Generated key name: %s", key_name)
-        return key_name
-
-    # ──────────────────────────────────────────────
-    # Full lifecycle: create / delete key
-    # ──────────────────────────────────────────────
-
-    async def create_key(self, user: User) -> dict | None:
-        """
-        Full key creation flow:
-
-        1. Check user key limits (skipped for admin).
-        2. Generate a WireGuard key pair.
-        3. Find the next free IP address.
-        4. Add the peer to the server.
-        5. Generate config, save files and QR code.
-        6. Create a database record.
-
-        Parameters
-        ----------
-        user : User
-            The user requesting the key.
-
-        Returns
-        -------
-        dict | None
-            Dictionary with key information on success, or ``None`` on error.
-            Keys: ``key_id``, ``key_name``, ``client_ip``, ``config_file``,
-            ``qr_code_file``, ``config_content``, ``public_key``,
-            ``private_key``, ``preshared_key``.
+        Создание VPN ключа для пользователя
+        :param user_id: ID пользователя
+        :param key_name: Имя ключа
+        :return: Словарь с данными ключа или None при ошибке
         """
         try:
-            # ── 1. Check limits ──────────────────────────
-            # Admin users are not subject to key limits.
-            if not user.is_admin:
-                with get_db_session() as session:
-                    active_keys = (
-                        session.query(VPNKey)
-                        .filter(
-                            VPNKey.user_id == user.id,
-                            VPNKey.is_active.is_(True),
-                        )
-                        .count()
-                    )
-                    max_keys = user.max_keys or 0
+            # 1. Генерируем ключи клиента
+            logger.info(f"Generating WireGuard keys for {key_name}")
+            private_key, public_key = self._generate_wg_keys()
+            logger.info(f"Keys generated successfully. Public key: {public_key[:20]}...")
 
-                    if max_keys > 0 and active_keys >= max_keys:
-                        logger.warning(
-                            "User %s (id=%d) reached key limit: %d/%d",
-                            user.username,
-                            user.id,
-                            active_keys,
-                            max_keys,
-                        )
-                        return None
+            # 2. Получаем следующий доступный IP
+            logger.info("Getting next available IP address")
+            client_ip = self.get_next_available_ip()
+            if not client_ip:
+                logger.error("No available IP addresses in network")
+                raise Exception("Нет доступных IP адресов в сети")
 
-            # ── 2. Generate key pair ─────────────────────
-            private_key, public_key = await self.generate_keys()
+            logger.info(f"Assigned IP: {client_ip}")
 
-            # ── 3. Get next free IP ──────────────────────
-            client_ip = await self.get_next_ip()
+            # 3. Получаем публичный ключ сервера
+            logger.info("Getting server public key")
+            server_public_key = self.get_server_public_key()
+            if not server_public_key:
+                logger.error("Failed to get server public key. Check SSH connection and Docker container.")
+                raise Exception("Не удалось получить публичный ключ сервера. Проверьте SSH подключение и Docker контейнер.")
 
-            # ── 4. Add peer to server ────────────────────
-            peer_info = await self.add_peer(public_key, private_key, client_ip)
-            if not peer_info:
-                logger.error("Failed to add peer to server for user %s", user.username)
-                return None
+            logger.info(f"Server public key retrieved: {server_public_key[:20]}...")
 
-            # ── 5. Generate config & files ───────────────
-            server_public_key = await self.get_server_public_key()
-            obfuscation_params = await self.get_server_obfuscation_params()
+            # 4. Добавляем peer на сервер
+            logger.info(f"Adding peer to server: {public_key[:20]}... with IP {client_ip}")
+            allowed_ips = f"{client_ip}/32"
+            if not self.add_peer(public_key, allowed_ips):
+                logger.error("Failed to add peer to server")
+                raise Exception("Не удалось добавить peer на сервер")
 
-            preshared_key = peer_info["preshared_key"]
+            logger.info("Peer added successfully")
 
-            config_content = self.generate_config(
-                private_key,
-                client_ip,
-                server_public_key,
-                obfuscation_params,
-                preshared_key=preshared_key,
-            )
+            # 5. Генерируем конфигурацию
+            config_content = self.generate_config(private_key, client_ip, server_public_key)
 
-            key_name = self.generate_key_name(user)
-            config_file = self.save_config_file(config_content, key_name)
-            qr_code_file = self.generate_qr_code(config_content, key_name)
+            # 6. Сохраняем файл конфигурации
+            # Проверка: существует ли уже конфигурация?
+            config_file_path = VPN_CONFIGS_DIR / f"{key_name}.conf"
+            if not config_file_path.exists():
+                # Создать новую конфигурацию
+                config_path = self.save_config_file(key_name, config_content, overwrite=True)
+                logger.info(f"Config file created: {config_path}")
+            else:
+                # Использовать существующую конфигурацию (не перезаписывать)
+                config_path = config_file_path
+                logger.info(f"Config file already exists, preserving: {config_path}")
 
-            vpn_text_key = self.generate_vpn_text_key(config_content)
-
-            # ── 6. Create DB record ──────────────────────
-            with get_db_session() as session:
-                vpn_key = VPNKey(
-                    user_id=user.id,
-                    key_name=key_name,
-                    config_file_path=config_file,
-                    qr_code_path=qr_code_file,
-                    protocol=VPN_PROTOCOL,
-                    client_ip=client_ip,
-                    public_key=public_key,
-                    private_key=private_key,
-                    created_by_bot=True,
-                    is_active=True,
-                )
-                session.add(vpn_key)
-                session.flush()
-                key_id = vpn_key.id
-
-            logger.info(
-                "Key created — id=%d, name=%s, user=%s, ip=%s",
-                key_id, key_name, user.username, client_ip,
-            )
+            # 7. Генерируем QR-код
+            qr_path = self.generate_qr_code(key_name, config_path)
+            if qr_path:
+                logger.info(f"QR code generated: {qr_path}")
 
             return {
-                "key_id": key_id,
-                "key_name": key_name,
-                "client_ip": client_ip,
-                "config_file": config_file,
-                "qr_code_file": qr_code_file,
-                "config_content": config_content,
-                "public_key": public_key,
-                "private_key": private_key,
-                "preshared_key": preshared_key,
-                "vpn_text_key": vpn_text_key,
+                'private_key': private_key,
+                'public_key': public_key,
+                'client_ip': client_ip,
+                'server_public_key': server_public_key,
+                'config_path': config_path,
+                'qr_path': qr_path,
+                'config_content': config_content
             }
 
         except Exception as e:
-            logger.error("Error creating key for user %s: %s", user.username, e, exc_info=True)
-            return None
+            logger.error(f"Failed to create VPN key: {e}", exc_info=True)
+            raise  # Пробрасываем исключение дальше для обработки в боте
 
-    async def delete_key(self, key_id: int) -> bool:
+    def get_all_peers(self) -> list:
         """
-        Full key deletion flow:
-
-        1. Look up the key in the database.
-        2. Remove the peer from the WireGuard interface.
-        3. Delete config and QR code files from disk.
-        4. Delete the database record.
-
-        Parameters
-        ----------
-        key_id : int
-            Primary key of the VPNKey record.
-
-        Returns
-        -------
-        bool
-            ``True`` if all steps completed successfully.
+        Получение списка всех пиров (peer'ов) с сервера
+        :return: Список словарей с информацией о пирах [{'public_key': ..., 'allowed_ips': ..., 'endpoint': ...}, ...]
         """
         try:
-            # ── 1. Find the key in DB ────────────────────
-            with get_db_session() as session:
-                vpn_key = session.query(VPNKey).filter(VPNKey.id == key_id).first()
-                if not vpn_key:
-                    logger.warning("Key id=%d not found in database", key_id)
-                    return False
+            logger.info(f"Getting all peers from interface {self.vpn_interface}")
+            stdout, stderr, exit_code = self._exec_command(f"{self.wg_path} show {self.vpn_interface} dump", docker_exec=True)
+            
+            if exit_code != 0:
+                logger.error(f"Failed to get peers. Exit code: {exit_code}, Stderr: {stderr}")
+                logger.error(f"Command output: {stdout}")
+                return []
+            
+            logger.debug(f"Raw dump output:\n{stdout}")
+            
+            peers = []
+            lines = stdout.strip().split('\n')
+            
+            logger.info(f"Total lines in dump: {len(lines)}")
+            
+            # Первая строка - это сам сервер (не peer), пропускаем её
+            for idx, line in enumerate(lines[1:], start=1):  # Пропускаем первую строку (сервер)
+                if not line.strip():
+                    continue
+                
+                logger.debug(f"Processing line {idx}: {line[:100]}...")
+                    
+                parts = line.split('\t')
+                logger.debug(f"Line {idx} parts count: {len(parts)}")
+                
+                # Формат dump: public_key    preshared_key    endpoint    allowed_ips    last_handshake    rx_bytes    tx_bytes    persistent_keepalive
+                if len(parts) >= 4:
+                    public_key = parts[0].strip()
+                    endpoint = parts[2].strip() if len(parts) > 2 and parts[2] else ""
+                    allowed_ips = parts[3].strip() if len(parts) > 3 and parts[3] else ""
+                    
+                    # Извлекаем IP из allowed_ips (формат: 10.8.1.X/32)
+                    ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', allowed_ips)
+                    client_ip = ip_match.group(1) if ip_match else None
+                    
+                    peers.append({
+                        'public_key': public_key,
+                        'client_ip': client_ip,
+                        'allowed_ips': allowed_ips,
+                        'endpoint': endpoint
+                    })
+                    logger.debug(f"Added peer: public_key={public_key[:30]}..., ip={client_ip}")
+                else:
+                    logger.warning(f"Line {idx} has insufficient parts ({len(parts)} < 4): {line[:100]}")
+            
+            logger.info(f"Found {len(peers)} peers on server")
+            
+            # Выводим детали найденных пиров для отладки
+            if peers:
+                logger.info("Peers found on server:")
+                for peer in peers:
+                    logger.info(f"  - Public key: {peer['public_key'][:30]}..., IP: {peer['client_ip']}, Endpoint: {peer.get('endpoint', 'N/A')}")
+            else:
+                logger.warning("No peers found on server!")
+            
+            return peers
+            
+        except Exception as e:
+            logger.error(f"Failed to get peers: {e}", exc_info=True)
+            return []
 
-                public_key = vpn_key.public_key
-                config_path = vpn_key.config_file_path
-                qr_path = vpn_key.qr_code_path
-                key_name = vpn_key.key_name
-
-            # ── 2. Remove peer from server ───────────────
-            if public_key:
-                removed = await self.remove_peer(public_key)
-                if not removed:
-                    logger.warning(
-                        "Could not remove peer %s from server (key id=%d), "
-                        "continuing with DB/file cleanup",
-                        public_key, key_id,
+    def sync_keys_with_server(self, db_session) -> dict:
+        """
+        Синхронизация ключей между БД и сервером
+        :param db_session: Сессия БД
+        :return: Словарь со статистикой синхронизации
+        """
+        from database import VPNKey, User
+        from datetime import datetime
+        
+        stats = {
+            'added_from_server': 0,
+            'removed_from_server': 0,
+            'errors': []
+        }
+        
+        try:
+            # Получаем все пиры с сервера
+            logger.info("Starting key synchronization with server...")
+            server_peers = self.get_all_peers()
+            logger.info(f"Server peers count: {len(server_peers)}")
+            
+            server_public_keys = {peer['public_key'] for peer in server_peers}
+            logger.info(f"Server public keys count: {len(server_public_keys)}")
+            
+            # Получаем все ключи из БД с публичными ключами
+            db_keys = db_session.query(VPNKey).filter(VPNKey.public_key.isnot(None)).all()
+            db_public_keys = {key.public_key for key in db_keys if key.public_key}
+            logger.info(f"DB keys count: {len(db_keys)}, DB public keys count: {len(db_public_keys)}")
+            
+            # Находим ключи на сервере, которых нет в БД
+            missing_in_db = server_public_keys - db_public_keys
+            logger.info(f"Keys on server but not in DB: {len(missing_in_db)}")
+            
+            if missing_in_db:
+                logger.info(f"Found {len(missing_in_db)} keys on server that are not in DB")
+                
+                # Создаем или находим системного пользователя для ключей, созданных не через бота
+                system_user = db_session.query(User).filter(User.telegram_id == 0).first()
+                if not system_user:
+                    system_user = User(
+                        telegram_id=0,
+                        username="system",
+                        first_name="System",
+                        is_active=True,
+                        is_admin=False,
+                        max_keys=999
                     )
+                    db_session.add(system_user)
+                    db_session.commit()
+                    db_session.refresh(system_user)
+                
+                # Добавляем недостающие ключи в БД
+                for peer in server_peers:
+                    if peer['public_key'] in missing_in_db:
+                        try:
+                            # Создаем имя ключа на основе IP и даты
+                            date_str = datetime.now().strftime("%Y%m%d_%H%M")
+                            ip_part = peer['client_ip'].replace('.', '_') if peer['client_ip'] else 'unknown'
+                            key_name = f"external_{ip_part}_{date_str}"
+                            
+                            # Проверяем уникальность имени
+                            existing = db_session.query(VPNKey).filter(VPNKey.key_name == key_name).first()
+                            counter = 1
+                            while existing:
+                                key_name = f"external_{ip_part}_{date_str}_{counter}"
+                                existing = db_session.query(VPNKey).filter(VPNKey.key_name == key_name).first()
+                                counter += 1
+                            
+                            vpn_key = VPNKey(
+                                user_id=system_user.id,
+                                key_name=key_name,
+                                protocol='amneziawg',
+                                client_ip=peer['client_ip'],
+                                public_key=peer['public_key'],
+                                private_key=None,  # Приватный ключ недоступен для ключей, созданных не через бота
+                                is_active=True,
+                                created_by_bot=False  # Ключ создан не через бота
+                            )
+                            db_session.add(vpn_key)
+                            stats['added_from_server'] += 1
+                            logger.info(f"Added key from server: {key_name} (IP: {peer['client_ip']})")
+                        except Exception as e:
+                            logger.error(f"Error adding key from server: {e}", exc_info=True)
+                            stats['errors'].append(f"Error adding key {peer['public_key'][:20]}...: {e}")
+                
+                db_session.commit()
+            
+            # Находим ключи в БД, которых нет на сервере
+            missing_on_server = db_public_keys - server_public_keys
+            
+            if missing_on_server:
+                logger.info(f"Found {len(missing_on_server)} keys in DB that are not on server")
+                
+                # Помечаем ключи как неактивные, если их нет на сервере
+                for key in db_keys:
+                    if key.public_key in missing_on_server and key.is_active:
+                        key.is_active = False
+                        stats['removed_from_server'] += 1
+                        logger.info(f"Marked key as inactive: {key.key_name} (not found on server)")
+                
+                db_session.commit()
+            
+            logger.info(f"Synchronization completed: added={stats['added_from_server']}, removed={stats['removed_from_server']}")
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Failed to synchronize keys: {e}", exc_info=True)
+            stats['errors'].append(f"Synchronization error: {e}")
+            return stats
 
-            # ── 3. Delete files ──────────────────────────
-            for fpath in (config_path, qr_path):
-                if fpath and os.path.exists(fpath):
-                    try:
-                        os.remove(fpath)
-                        logger.debug("Deleted file: %s", fpath)
-                    except OSError as e:
-                        logger.warning("Failed to delete file %s: %s", fpath, e)
+    def delete_vpn_key(self, public_key: Optional[str], key_name: str) -> bool:
+        """
+        Удаление VPN ключа
+        :param public_key: Публичный ключ клиента (может быть None для старых ключей)
+        :param key_name: Имя ключа
+        :return: True если успешно
+        """
+        try:
+            # 1. Удаляем peer с сервера (если есть public_key)
+            if public_key:
+                logger.info(f"Removing peer from server: {public_key[:20]}...")
+                if not self.remove_peer(public_key):
+                    logger.warning(f"Failed to remove peer from server, but continuing with file deletion")
+                else:
+                    logger.info("Peer removed from server successfully")
+            else:
+                logger.warning(f"Public key is None for {key_name}, skipping server deletion")
 
-            # ── 4. Delete DB record ──────────────────────
-            with get_db_session() as session:
-                vpn_key = session.query(VPNKey).filter(VPNKey.id == key_id).first()
-                if vpn_key:
-                    session.delete(vpn_key)
+            # 2. Удаляем файлы
+            config_path = VPN_CONFIGS_DIR / f"{key_name}.conf"
+            qr_path = VPN_CONFIGS_DIR / f"{key_name}.png"
 
-            logger.info("Key deleted — id=%d, name=%s", key_id, key_name)
+            if config_path.exists():
+                config_path.unlink()
+                logger.info(f"Deleted config file: {config_path}")
+            else:
+                logger.warning(f"Config file not found: {config_path}")
+
+            if qr_path and qr_path.exists():
+                qr_path.unlink()
+                logger.info(f"Deleted QR code: {qr_path}")
+            elif qr_path:
+                logger.warning(f"QR code file not found: {qr_path}")
+
             return True
 
         except Exception as e:
-            logger.error("Error deleting key id=%d: %s", key_id, e, exc_info=True)
+            logger.error(f"Failed to delete VPN key: {e}", exc_info=True)
             return False
 
-    # ──────────────────────────────────────────────
-    # Statistics & sync
-    # ──────────────────────────────────────────────
+    # ========== АСИНХРОННЫЕ ВЕРСИИ МЕТОДОВ ==========
+    # Обертки для выполнения блокирующих операций в отдельном потоке
 
-    async def get_wireguard_stats(self) -> list[dict]:
+    async def _ssh_exec_async(self, command: str, docker_exec: bool = False) -> Tuple[str, str, int]:
         """
-        Parse ``wg show`` dump output to collect per-peer traffic statistics.
-
-        Peer lines in the dump have the format::
-
-            public_key  preshared_key  endpoint  allowed_ips  latest_handshake
-            transfer_rx  transfer_tx  persistent_keepalive  ...
-
-        Returns
-        -------
-        list[dict]
-            Each dict contains: ``public_key``, ``endpoint``, ``allowed_ips``,
-            ``latest_handshake``, ``transfer_rx``, ``transfer_tx``.
+        Асинхронная версия _ssh_exec
+        Выполняет SSH команду в отдельном потоке
         """
-        stats: list[dict] = []
-        try:
-            dump = await self._async_docker_cmd(f"wg show {VPN_INTERFACE} dump")
-            lines = dump.strip().split("\n")
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self._ssh_exec,
+            command,
+            docker_exec
+        )
 
-            # Skip first line (interface)
-            for line in lines[1:]:
-                parts = line.split("\t")
-                if len(parts) < 8:
-                    continue
+    async def get_server_public_key_async(self) -> Optional[str]:
+        """Асинхронная версия get_server_public_key"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self.get_server_public_key
+        )
 
-                stats.append({
-                    "public_key": parts[0],
-                    "endpoint": parts[2] if parts[2] != "(none)" else None,
-                    "allowed_ips": parts[3],
-                    "latest_handshake": (
-                        datetime.fromtimestamp(int(parts[4])).isoformat()
-                        if parts[4] != "0" else None
-                    ),
-                    "transfer_rx": int(parts[5]),
-                    "transfer_tx": int(parts[6]),
-                })
+    async def get_next_available_ip_async(self) -> Optional[str]:
+        """Асинхронная версия get_next_available_ip"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self.get_next_available_ip
+        )
 
-            logger.info("Retrieved stats for %d peers", len(stats))
-        except Exception as e:
-            logger.error("Failed to get WireGuard stats: %s", e)
+    async def add_peer_async(self, public_key: str, allowed_ips: str, preshared_key: Optional[str] = None) -> bool:
+        """Асинхронная версия add_peer"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self.add_peer,
+            public_key,
+            allowed_ips,
+            preshared_key
+        )
 
-        return stats
+    async def remove_peer_async(self, public_key: str) -> bool:
+        """Асинхронная версия remove_peer"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self.remove_peer,
+            public_key
+        )
 
-    async def sync_keys_with_server(self) -> dict:
+    async def create_vpn_key_async(self, user_id: int, key_name: str) -> Optional[Dict]:
         """
-        Synchronise database VPN key records with the actual server state.
-
-        * Keys present in DB but missing on the server are marked inactive.
-        * Peers present on the server but missing in DB are reported.
-
-        Returns
-        -------
-        dict
-            Summary with keys: ``synced``, ``deactivated``, ``orphaned_peers``,
-            ``total_db_keys``, ``total_server_peers``.
+        Асинхронная версия create_vpn_key
+        Выполняет создание VPN ключа в отдельном потоке
         """
-        result = {
-            "synced": 0,
-            "deactivated": 0,
-            "orphaned_peers": 0,
-            "total_db_keys": 0,
-            "total_server_peers": 0,
-        }
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self.create_vpn_key,
+            user_id,
+            key_name
+        )
 
-        try:
-            # Get server peers
-            dump = await self._async_docker_cmd(f"wg show {VPN_INTERFACE} dump")
-            lines = dump.strip().split("\n")
+    async def delete_vpn_key_async(self, public_key: Optional[str], key_name: str) -> bool:
+        """Асинхронная версия delete_vpn_key"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self.delete_vpn_key,
+            public_key,
+            key_name
+        )
 
-            server_pubkeys: set[str] = set()
-            for line in lines[1:]:
-                parts = line.split("\t")
-                if parts:
-                    server_pubkeys.add(parts[0])
+    async def get_all_peers_async(self) -> list:
+        """Асинхронная версия get_all_peers"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self.get_all_peers
+        )
 
-            result["total_server_peers"] = len(server_pubkeys)
+    def shutdown(self):
+        """Закрытие executor при завершении работы"""
+        if self.executor:
+            self.executor.shutdown(wait=True)
 
-            # Get DB keys
-            with get_db_session() as session:
-                db_keys = (
-                    session.query(VPNKey)
-                    .filter(VPNKey.is_active.is_(True))
-                    .all()
-                )
-                result["total_db_keys"] = len(db_keys)
-                db_pubkeys: set[str] = set()
 
-                for key in db_keys:
-                    if key.public_key:
-                        db_pubkeys.add(key.public_key)
-
-                    if key.public_key and key.public_key in server_pubkeys:
-                        # Key exists on both sides — synced
-                        result["synced"] += 1
-                    elif key.public_key and key.public_key not in server_pubkeys:
-                        # Key in DB but not on server — deactivate
-                        key.is_active = False
-                        result["deactivated"] += 1
-                        logger.warning(
-                            "Deactivated key id=%d (%s) — not found on server",
-                            key.id, key.key_name,
-                        )
-
-            # Orphaned peers: on server but not in DB
-            orphaned = server_pubkeys - db_pubkeys
-            result["orphaned_peers"] = len(orphaned)
-            if orphaned:
-                logger.warning(
-                    "Found %d orphaned peers on server (not in DB): %s",
-                    len(orphaned),
-                    ", ".join(list(orphaned)[:5]) + ("..." if len(orphaned) > 5 else ""),
-                )
-
-            logger.info(
-                "Sync complete — synced=%d, deactivated=%d, orphaned=%d",
-                result["synced"], result["deactivated"], result["orphaned_peers"],
-            )
-
-        except Exception as e:
-            logger.error("Failed to sync keys with server: %s", e, exc_info=True)
-
-        return result
+# Глобальный экземпляр менеджера VPN
+vpn_manager = VPNManager()

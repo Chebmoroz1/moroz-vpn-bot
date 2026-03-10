@@ -1,10 +1,17 @@
 [Unit]
-Description=MOROZ VPN traffic snapshots collector
+Description=VPN Traffic Snapshots Collector
+After=network.target
 
 [Service]
 Type=oneshot
+User=root
+Group=root
 WorkingDirectory=/opt/vpn-bot
+Environment="PATH=/usr/bin:/usr/local/bin"
 ExecStart=/usr/bin/python3 /opt/vpn-bot/sync_traffic_snapshots.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vpn-traffic-snapshots
 
 [Install]
 WantedBy=multi-user.target

@@ -1,14 +1,27 @@
 [Unit]
-Description=MOROZ VPN Telegram Bot
+Description=VPN Telegram Bot
 After=network.target
 
 [Service]
 Type=simple
+User=vpnbot
+Group=vpnbot
 WorkingDirectory=/opt/vpn-bot
+Environment="PATH=/usr/bin:/usr/local/bin"
+EnvironmentFile=/opt/vpn-bot/.env
 ExecStart=/usr/bin/python3 /opt/vpn-bot/bot.py
 Restart=always
-RestartSec=5
-User=www-data
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vpn-bot
+
+# Безопасность
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/vpn-bot
 
 [Install]
 WantedBy=multi-user.target
