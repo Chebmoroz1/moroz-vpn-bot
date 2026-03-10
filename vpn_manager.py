@@ -268,7 +268,12 @@ class VPNManager:
     # Peer management
     # ──────────────────────────────────────────────
 
-    async def add_peer(self, public_key: str, client_ip: str) -> str | None:
+    async def add_peer(
+        self,
+        public_key: str,
+        private_key: str,
+        client_ip: str,
+    ) -> dict | None:
         """
         Add a new peer to the running WireGuard interface and persist the config.
 
@@ -276,15 +281,56 @@ class VPNManager:
         ----------
         public_key : str
             Client public key (base64).
+        private_key : str
+            Client private key (base64). Not used on the server directly but
+            returned for convenience so the caller has a full key bundle.
         client_ip : str
             Client tunnel IP address (without CIDR).
 
         Returns
         -------
-        str | None
-            The generated preshared key on success, or ``None`` on error.
+        dict | None
+            On success, a dict with keys:
+
+            ``public_key``, ``private_key``, ``preshared_key``, ``client_ip``.
+            Returns ``None`` on error or if a duplicate is detected.
         """
         try:
+            # Fetch current peers to prevent duplicates by public_key or IP.
+            dump = await self._async_docker_cmd(f"wg show {VPN_INTERFACE} dump")
+            lines = dump.strip().split("\n")
+
+            existing_pubkeys: set[str] = set()
+            used_ips: set[str] = set()
+
+            for line in lines[1:]:
+                parts = line.split("\t")
+                if len(parts) < 4:
+                    continue
+                existing_pubkeys.add(parts[0])
+                allowed_ips = parts[3]
+                for cidr in allowed_ips.split(","):
+                    cidr = cidr.strip()
+                    if cidr and cidr != "(none)":
+                        ip = cidr.split("/")[0]
+                        used_ips.add(ip)
+
+            if public_key in existing_pubkeys:
+                logger.error(
+                    "Refusing to add peer: public_key already exists on %s: %s",
+                    VPN_INTERFACE,
+                    public_key,
+                )
+                return None
+
+            if client_ip in used_ips:
+                logger.error(
+                    "Refusing to add peer: IP %s already in use on %s",
+                    client_ip,
+                    VPN_INTERFACE,
+                )
+                return None
+
             # Generate a unique preshared key for this peer.
             preshared_key = await self._async_docker_cmd("wg genpsk")
 
@@ -305,21 +351,45 @@ class VPNManager:
                 f"bash -c 'wg showconf {VPN_INTERFACE} > {VPN_CONFIG_PATH}'"
             )
 
-            # Verify the peer was actually added.
-            dump = await self._async_docker_cmd(f"wg show {VPN_INTERFACE} dump")
-            if public_key in dump:
-                logger.info("Peer added successfully: %s (%s)", public_key, client_ip)
-                return preshared_key
+            # Verify the peer was actually added and has the expected AllowedIPs.
+            dump_after = await self._async_docker_cmd(f"wg show {VPN_INTERFACE} dump")
+            peer_found = False
+            for line in dump_after.strip().split("\n")[1:]:
+                parts = line.split("\t")
+                if len(parts) < 4:
+                    continue
+                if parts[0] != public_key:
+                    continue
+                peer_found = True
+                allowed_ips = parts[3]
+                if f"{client_ip}/32" not in [c.strip() for c in allowed_ips.split(",")]:
+                    logger.error(
+                        "Peer %s added but missing expected AllowedIPs %s/32 (got: %s)",
+                        public_key,
+                        client_ip,
+                        allowed_ips,
+                    )
+                    return None
+                break
 
-            logger.error(
-                "Peer NOT found after add — public_key=%s, ip=%s",
-                public_key,
-                client_ip,
-            )
-            return None
+            if not peer_found:
+                logger.error(
+                    "Peer NOT found after add — public_key=%s, ip=%s",
+                    public_key,
+                    client_ip,
+                )
+                return None
+
+            logger.info("Peer added successfully: %s (%s)", public_key, client_ip)
+            return {
+                "public_key": public_key,
+                "private_key": private_key,
+                "preshared_key": preshared_key,
+                "client_ip": client_ip,
+            }
 
         except Exception as e:
-            logger.error("Failed to add peer %s: %s", public_key, e)
+            logger.error("Failed to add peer %s: %s", public_key, e, exc_info=True)
             return None
 
     async def remove_peer(self, public_key: str) -> bool:
@@ -539,7 +609,8 @@ class VPNManager:
         dict | None
             Dictionary with key information on success, or ``None`` on error.
             Keys: ``key_id``, ``key_name``, ``client_ip``, ``config_file``,
-            ``qr_code_file``, ``config_content``.
+            ``qr_code_file``, ``config_content``, ``public_key``,
+            ``private_key``, ``preshared_key``.
         """
         try:
             # ── 1. Check limits ──────────────────────────
@@ -573,14 +644,16 @@ class VPNManager:
             client_ip = await self.get_next_ip()
 
             # ── 4. Add peer to server ────────────────────
-            preshared_key = await self.add_peer(public_key, client_ip)
-            if not preshared_key:
+            peer_info = await self.add_peer(public_key, private_key, client_ip)
+            if not peer_info:
                 logger.error("Failed to add peer to server for user %s", user.username)
                 return None
 
             # ── 5. Generate config & files ───────────────
             server_public_key = await self.get_server_public_key()
             obfuscation_params = await self.get_server_obfuscation_params()
+
+            preshared_key = peer_info["preshared_key"]
 
             config_content = self.generate_config(
                 private_key,
@@ -624,6 +697,9 @@ class VPNManager:
                 "config_file": config_file,
                 "qr_code_file": qr_code_file,
                 "config_content": config_content,
+                "public_key": public_key,
+                "private_key": private_key,
+                "preshared_key": preshared_key,
             }
 
         except Exception as e:
