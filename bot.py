@@ -775,6 +775,19 @@ class VPNBot:
         except Exception as e:
             logger.warning("Failed to send QR image: %s", e)
 
+        # Optional Amnezia-compatible text key (vpn://...) if available.
+        vpn_text_key = result.get("vpn_text_key")
+        if vpn_text_key:
+            try:
+                await message.reply_text(
+                    "Текстовый ключ для AmneziaVPN (формат vpn://):\n\n"
+                    f"{vpn_text_key}\n\n"
+                    "Скопируй его полностью и вставь в AmneziaVPN "
+                    "через пункт добавления подключения по ключу.",
+                )
+            except Exception as e:
+                logger.warning("Failed to send vpn_text_key: %s", e)
+
         await message.reply_text(
             "Ключ успешно создан. Конфигурацию можно сохранить и импортировать в клиент.",
             reply_markup=build_main_keyboard(),

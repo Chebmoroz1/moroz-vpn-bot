@@ -14,6 +14,9 @@ import re
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import base64
+import struct
+import zlib
 
 import qrcode
 from PIL import Image
@@ -448,7 +451,7 @@ class VPNManager:
         Returns
         -------
         str
-            Complete ``.conf`` file content.
+            Complete WireGuard/AmneziaWG ``.conf`` file content.
         """
         config = (
             f"[Interface]\n"
@@ -478,6 +481,26 @@ class VPNManager:
             f"PersistentKeepalive = 25\n"
         )
         return config
+
+    def generate_vpn_text_key(self, config_content: str) -> str:
+        """
+        Generate a vpn://-style text key for Amnezia-compatible clients.
+
+        The exact internal format of Amnezia's vpn:// keys is not fully
+        documented publicly, but it is known that they are based on a
+        zlib-compressed payload encoded with URL-safe base64 using a
+        Qt-style qCompress header (4-byte big-endian length prefix).
+
+        Here we treat the generated WireGuard/AmneziaWG config text as
+        the payload, compress it accordingly, and return a shareable
+        ``vpn://...`` string that clients can import as a text key.
+        """
+        data = config_content.encode("utf-8")
+        header = struct.pack(">I", len(data))
+        compressed = zlib.compress(data, level=9)
+        payload = header + compressed
+        b64 = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+        return f"vpn://{b64}"
 
     def save_config_file(self, config_content: str, key_name: str) -> str:
         """
@@ -666,6 +689,8 @@ class VPNManager:
             config_file = self.save_config_file(config_content, key_name)
             qr_code_file = self.generate_qr_code(config_content, key_name)
 
+            vpn_text_key = self.generate_vpn_text_key(config_content)
+
             # ── 6. Create DB record ──────────────────────
             with get_db_session() as session:
                 vpn_key = VPNKey(
@@ -699,6 +724,7 @@ class VPNManager:
                 "public_key": public_key,
                 "private_key": private_key,
                 "preshared_key": preshared_key,
+                "vpn_text_key": vpn_text_key,
             }
 
         except Exception as e:
