@@ -396,6 +396,7 @@ class VPNBot:
 
             if pending and message.text:
                 # Store user message in DB according to the pending kind
+                kind = pending.get("kind")
                 if kind in {"question", "problem", "key_request"}:
                     text_to_store = message.text.strip()
                     if len(text_to_store) > 1000:
