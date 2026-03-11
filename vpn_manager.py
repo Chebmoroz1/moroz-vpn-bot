@@ -377,11 +377,16 @@ class VPNManager:
                         if ip_match:
                             used_ips.add(ip_match.group(1))
 
-        # Находим свободный IP (начинаем с 10.8.1.2, т.к. 10.8.1.0/24 - это сеть, 10.8.1.1 обычно шлюз)
+        # Находим свободный IP.
+        # Дополнительно: чтобы минимизировать пересечения с уже выданными ключами
+        # внешним Amnezia-клиентом, начинаем выдачу адресов из верхней части подсети
+        # (хосты с последним октетом >= 128).
         for host in self.vpn_network.hosts():
             ip_str = str(host)
+            last_octet = int(ip_str.split('.')[-1])
             # Пропускаем первые несколько адресов (0, 1 обычно зарезервированы)
-            if ip_str.split('.')[-1] in ['0', '1']:
+            # и всю "нижнюю" половину подсети, чтобы не пересекаться с Amnezia-клиентом.
+            if last_octet < 128:
                 continue
             if ip_str not in used_ips:
                 return ip_str
@@ -663,6 +668,120 @@ PersistentKeepalive = 25
             logger.error(f"Failed to get peers: {e}", exc_info=True)
             return []
 
+    def get_peer_status(
+        self,
+        public_key: Optional[str] = None,
+        client_ip: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """
+        Получение статуса конкретного peer'а по public_key или client_ip.
+
+        Возвращает словарь с полями:
+        - public_key
+        - client_ip
+        - allowed_ips
+        - endpoint
+        - last_handshake (int, unix timestamp)
+        - rx_bytes
+        - tx_bytes
+        - persistent_keepalive
+        """
+        if not public_key and not client_ip:
+            logger.error("get_peer_status called without public_key or client_ip")
+            return None
+
+        try:
+            logger.info(
+                f"Getting peer status for "
+                f"{'public_key=' + public_key[:20] + '...' if public_key else ''}"
+                f"{' client_ip=' + client_ip if client_ip else ''}"
+            )
+            stdout, stderr, exit_code = self._exec_command(
+                f"{self.wg_path} show {self.vpn_interface} dump", docker_exec=True
+            )
+
+            if exit_code != 0:
+                logger.error(
+                    f"Failed to get peer status. Exit code: {exit_code}, Stderr: {stderr}"
+                )
+                return None
+
+            lines = stdout.strip().split("\n")
+            if not lines:
+                return None
+
+            # Первая строка - сервер, пропускаем
+            for idx, line in enumerate(lines[1:], start=1):
+                if not line.strip():
+                    continue
+
+                parts = line.split("\t")
+                # Ожидаемый формат:
+                # public_key, preshared_key, endpoint, allowed_ips,
+                # last_handshake, rx_bytes, tx_bytes, persistent_keepalive, ...
+                if len(parts) < 7:
+                    logger.debug(
+                        f"Line {idx} has insufficient parts ({len(parts)} < 7): {line[:100]}"
+                    )
+                    continue
+
+                peer_public_key = parts[0].strip()
+                endpoint = parts[2].strip() if parts[2] else ""
+                allowed_ips = parts[3].strip() if parts[3] else ""
+                last_handshake_raw = parts[4].strip() if len(parts) > 4 else "0"
+                rx_bytes_raw = parts[5].strip() if len(parts) > 5 else "0"
+                tx_bytes_raw = parts[6].strip() if len(parts) > 6 else "0"
+                persistent_keepalive = parts[7].strip() if len(parts) > 7 else ""
+
+                ip_match = re.search(r"(\d+\.\d+\.\d+\.\d+)", allowed_ips)
+                peer_client_ip = ip_match.group(1) if ip_match else None
+
+                # Фильтрация по public_key / client_ip
+                if public_key and peer_public_key != public_key:
+                    continue
+                if client_ip and peer_client_ip != client_ip:
+                    continue
+
+                try:
+                    last_handshake = int(last_handshake_raw or "0")
+                except ValueError:
+                    last_handshake = 0
+
+                try:
+                    rx_bytes = int(rx_bytes_raw or "0")
+                except ValueError:
+                    rx_bytes = 0
+
+                try:
+                    tx_bytes = int(tx_bytes_raw or "0")
+                except ValueError:
+                    tx_bytes = 0
+
+                status: Dict = {
+                    "public_key": peer_public_key,
+                    "client_ip": peer_client_ip,
+                    "allowed_ips": allowed_ips,
+                    "endpoint": endpoint,
+                    "last_handshake": last_handshake,
+                    "rx_bytes": rx_bytes,
+                    "tx_bytes": tx_bytes,
+                    "persistent_keepalive": persistent_keepalive,
+                }
+
+                logger.info(
+                    f"Peer status: public_key={peer_public_key[:30]}..., "
+                    f"ip={peer_client_ip}, rx={rx_bytes}, tx={tx_bytes}, "
+                    f"last_handshake={last_handshake}"
+                )
+                return status
+
+            logger.info("Peer not found in dump")
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to get peer status: {e}", exc_info=True)
+            return None
+
     def sync_keys_with_server(self, db_session) -> dict:
         """
         Синхронизация ключей между БД и сервером
@@ -894,6 +1013,20 @@ PersistentKeepalive = 25
         return await loop.run_in_executor(
             self.executor,
             self.get_all_peers
+        )
+
+    async def get_peer_status_async(
+        self,
+        public_key: Optional[str] = None,
+        client_ip: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Асинхронная версия get_peer_status"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self.get_peer_status,
+            public_key,
+            client_ip,
         )
 
     def shutdown(self):

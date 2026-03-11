@@ -935,6 +935,12 @@ class VPNBot:
                     await self._handle_admin_delete_key(update, context, db_user, key_id)
                 else:
                     await query.answer("❌ У вас нет доступа.", show_alert=True)
+            elif data.startswith("admin_key_status:"):
+                if db_user.is_admin:
+                    key_id = int(data.split(":")[1])
+                    await self._handle_admin_key_status(update, context, db_user, key_id)
+                else:
+                    await query.answer("❌ У вас нет доступа.", show_alert=True)
             elif data == "help":
                 await self._handle_help(update, context)
             elif data == "noop":
@@ -1672,7 +1678,7 @@ class VPNBot:
                 "🔑 Все активные ключи\n"
                 f"Страница {page + 1}/{total_pages}\n"
                 f"Всего ключей: {total_keys}\n\n"
-                "Нажмите на кнопку, чтобы удалить ключ."
+                "Нажмите 🗑 чтобы удалить ключ или 📶 чтобы посмотреть статус подключения."
             )
 
             if not page_keys:
@@ -1681,12 +1687,17 @@ class VPNBot:
             keyboard = []
             for key in page_keys:
                 owner = self._get_user_display_name_with_username(key.user)
-                button_label = f"🗑 {key.key_name[:18]} • {owner[:20]}"
+                delete_label = f"🗑 {key.key_name[:14]} • {owner[:14]}"
+                status_label = "📶 Статус"
                 keyboard.append([
                     InlineKeyboardButton(
-                        button_label,
+                        delete_label,
                         callback_data=f"admin_delete_key:{key.id}"
-                    )
+                    ),
+                    InlineKeyboardButton(
+                        status_label,
+                        callback_data=f"admin_key_status:{key.id}"
+                    ),
                 ])
 
             if total_pages > 1:
@@ -1742,6 +1753,87 @@ class VPNBot:
         except Exception as e:
             logger.error(f"Error deleting key: {e}", exc_info=True)
             await query.answer("❌ Произошла ошибка при удалении.", show_alert=True)
+        finally:
+            db.close()
+
+    async def _handle_admin_key_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User, key_id: int):
+        """Показ статуса VPN ключа (по данным WireGuard/AmneziaWG)"""
+        query = update.callback_query
+
+        db = get_db_session()
+        try:
+            key = db.query(VPNKey).filter(VPNKey.id == key_id).first()
+            if not key:
+                await query.answer("❌ Ключ не найден.", show_alert=True)
+                return
+
+            if not key.public_key and not key.client_ip:
+                await query.answer("❌ Для этого ключа нет данных для статуса.", show_alert=True)
+                return
+
+            await query.answer("⏳ Получение статуса ключа...")
+
+            # Получаем статус peer'а из WireGuard
+            status = await vpn_manager.get_peer_status_async(
+                public_key=key.public_key,
+                client_ip=key.client_ip,
+            )
+
+            if not status:
+                text = (
+                    f"📶 Статус ключа:\n\n"
+                    f"🔑 {key.key_name}\n"
+                    f"IP: {key.client_ip or 'не задан'}\n\n"
+                    "Ключ не найден в текущей конфигурации WireGuard.\n"
+                    "Возможные причины:\n"
+                    "• peer ещё не подключался\n"
+                    "• ключ был удалён с сервера\n"
+                    "• конфигурация сервера ещё не обновлена"
+                )
+            else:
+                from datetime import datetime
+
+                last_handshake_ts = status.get("last_handshake") or 0
+                if last_handshake_ts:
+                    last_handshake_str = datetime.utcfromtimestamp(last_handshake_ts).strftime(
+                        "%d.%m.%Y %H:%M:%S UTC"
+                    )
+                else:
+                    last_handshake_str = "никогда"
+
+                rx_bytes = status.get("rx_bytes", 0)
+                tx_bytes = status.get("tx_bytes", 0)
+                endpoint = status.get("endpoint") or "неизвестен"
+                allowed_ips = status.get("allowed_ips") or "—"
+
+                def _fmt_bytes(val: int) -> str:
+                    for unit in ["B", "KiB", "MiB", "GiB"]:
+                        if val < 1024 or unit == "GiB":
+                            return f"{val:.1f} {unit}"
+                        val /= 1024
+                    return f"{val:.1f} GiB"
+
+                text = (
+                    f"📶 Статус ключа:\n\n"
+                    f"🔑 {key.key_name}\n"
+                    f"IP: {status.get('client_ip') or key.client_ip or 'не задан'}\n"
+                    f"AllowedIPs: {allowed_ips}\n"
+                    f"Endpoint: {endpoint}\n\n"
+                    f"Последний handshake: {last_handshake_str}\n"
+                    f"Входящий трафик (rx): {_fmt_bytes(rx_bytes)}\n"
+                    f"Исходящий трафик (tx): {_fmt_bytes(tx_bytes)}\n"
+                )
+
+            keyboard = [
+                [InlineKeyboardButton("◀️ Назад к списку ключей", callback_data="admin_all_keys")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.message.reply_text(text=text, reply_markup=reply_markup)
+
+        except Exception as e:
+            logger.error(f"Error getting key status: {e}", exc_info=True)
+            await query.answer("❌ Ошибка при получении статуса.", show_alert=True)
         finally:
             db.close()
 
