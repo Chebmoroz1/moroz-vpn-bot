@@ -16,13 +16,11 @@ from telegram.ext import (
 from telegram.error import BadRequest, TimedOut, NetworkError, Conflict
 
 from config import BOT_TOKEN, ADMIN_ID, VPN_CONFIGS_DIR, WEB_SERVER_URL
-from database import init_db, get_db_session, User, VPNKey, Payment
+from database import init_db, get_db_session, User, VPNKey, Payment, TrafficStatistics
 from sqlalchemy import func
 from contacts import contacts_manager
 from vpn_manager import vpn_manager
 from config_manager import config_manager
-from price_calculator import price_calculator
-import requests
 
 # Настройка логирования
 logging.basicConfig(
@@ -503,12 +501,32 @@ class VPNBot:
                 await self._handle_admin_setting_edit_text(update, context, db_user, setting_key, text_msg)
                 return
             
-            # Проверяем, ожидается ли ввод суммы доната
-            if context.user_data.get('waiting_for_donation_amount'):
+            # Проверяем, ожидается ли текст рассылки от администратора
+            if db_user and db_user.is_admin and context.user_data.get('admin_broadcast_waiting_text'):
+                # Сохраняем текст рассылки и показываем предпросмотр
+                context.user_data['admin_broadcast_waiting_text'] = False
+                context.user_data['admin_broadcast_text'] = text_msg
+
+                # Подсчитваем количество получателей (активные пользователи с telegram_id)
+                recipients = db.query(User).filter(
+                    User.telegram_id.isnot(None),
+                    User.is_active == True,
+                ).count()
+
+                preview_text = (
+                    "📢 Предпросмотр рассылки:\n\n"
+                    f"{text_msg}\n\n"
+                    f"Получателей: {recipients}"
+                )
+                keyboard = [
+                    [InlineKeyboardButton(f"📤 Отправить ({recipients})", callback_data="admin_broadcast_confirm")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="admin_broadcast_cancel")],
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
                 db.close()
-                await self._handle_donation_amount_input(update, context, db_user, text_msg)
+                await update.message.reply_text(preview_text, reply_markup=reply_markup)
                 return
-            
+
             # Проверяем, добавляется ли настройка
             if db_user and db_user.is_admin and context.user_data.get('admin_adding_setting'):
                 category = context.user_data.get('admin_adding_setting')
@@ -690,7 +708,6 @@ class VPNBot:
 
         keyboard = [
             [InlineKeyboardButton("🔐 Получить AmneziaWG ключ", callback_data="create_key")],
-            [InlineKeyboardButton("💳 Оплатить VPN", callback_data="pay_vpn")],
             [InlineKeyboardButton("📋 Мои ключи", callback_data="my_keys")],
         ]
 
@@ -721,41 +738,14 @@ class VPNBot:
         data = query.data
         user_id = query.from_user.id
 
-        # Обработка меню покупки для неавторизованных пользователей (до проверки db_user)
-        if data == "purchase_menu":
-            await self._show_purchase_menu(update, context)
-            return
-        elif data.startswith("purchase_months:"):
-            action = data.split(":")[1]
-            await self._handle_purchase_months(update, context, action)
-            return
-        elif data.startswith("purchase_codes:"):
-            action = data.split(":")[1]
-            await self._handle_purchase_codes(update, context, action)
-            return
-        elif data == "purchase_pay":
-            await self._handle_purchase_pay(update, context)
-            return
-        elif data == "back_to_inactive_menu":
-            # Получаем пользователя для показа меню неактивных
-            db = get_db_session()
-            try:
-                db_user = db.query(User).filter(User.telegram_id == user_id).first()
-                if db_user and not db_user.is_active and not db_user.is_admin:
-                    await self._show_inactive_user_menu(update, context, db_user)
-                else:
-                    await self._show_purchase_menu(update, context)
-            finally:
-                db.close()
-            return
-        
-        # Для остальных действий нужна авторизация
+        # Для всех действий нужна авторизация
         db = get_db_session()
         try:
             db_user = db.query(User).filter(User.telegram_id == user_id).first()
             if not db_user:
-                # Если пользователь не найден, показываем меню покупки
-                await self._show_purchase_menu(update, context)
+                await query.message.reply_text(
+                    "❌ Профиль не найден. Отправьте /start и следуйте инструкциям для активации."
+                )
                 return
             elif not db_user.is_active and not db_user.is_admin:
                 # Если пользователь неактивен, обрабатываем специальные действия
@@ -765,28 +755,31 @@ class VPNBot:
                 elif data == "provide_phone":
                     await self._handle_provide_phone(update, context, db_user)
                     return
-                elif data not in ["help", "purchase_menu", "request_activation", "provide_phone"]:
+                elif data not in ["help", "request_activation", "provide_phone"]:
                     # Для других действий показываем меню неактивных пользователей
                     await self._show_inactive_user_menu(update, context, db_user)
                     return
 
             if data == "create_key":
                 await self._handle_create_key(update, context, db_user)
-            elif data == "pay_vpn":
-                await self._show_donation_menu(update, context, db_user)
-            elif data.startswith("donation_amount:"):
-                amount = int(data.split(":")[1])
-                await self._handle_donation_payment(update, context, db_user, amount)
-            elif data == "donation_custom":
-                await self._handle_custom_donation(update, context, db_user)
             elif data == "my_keys":
                 await self._handle_my_keys(update, context, db_user)
             elif data.startswith("delete_key:"):
                 # Получаем key_id из callback_data
                 key_id = int(data.split(":")[1])
                 await self._handle_delete_key(update, context, db_user, key_id)
-            elif data == "check_payment_balance":
-                await self._handle_check_payment_balance(update, context, db_user)
+            elif data.startswith("key_stats:"):
+                key_id = int(data.split(":")[1])
+                await self._handle_user_key_stats(update, context, db_user, key_id, period="month")
+            elif data.startswith("key_stats_period:"):
+                # Формат: key_stats_period:{key_id}:{period}
+                parts = data.split(":")
+                if len(parts) == 3:
+                    key_id = int(parts[1])
+                    period = parts[2]
+                    await self._handle_user_key_stats(update, context, db_user, key_id, period=period)
+            elif data == "request_more_keys":
+                await self._handle_request_more_keys(update, context, db_user)
             elif data == "back_to_menu":
                 await self._show_main_menu(update, context, db_user)
             elif data == "admin_panel":
@@ -845,6 +838,21 @@ class VPNBot:
                 if db_user.is_admin:
                     category = data.split(":")[1]
                     await self._handle_admin_setting_add(update, context, db_user, category)
+            elif data == "admin_broadcast":
+                if db_user.is_admin:
+                    await self._handle_admin_broadcast(update, context, db_user)
+                else:
+                    await query.answer("❌ У вас нет доступа.", show_alert=True)
+            elif data == "admin_broadcast_confirm":
+                if db_user.is_admin:
+                    await self._handle_admin_broadcast_confirm(update, context, db_user)
+                else:
+                    await query.answer("❌ У вас нет доступа.", show_alert=True)
+            elif data == "admin_broadcast_cancel":
+                if db_user.is_admin:
+                    await self._handle_admin_broadcast_cancel(update, context, db_user)
+                else:
+                    await query.answer("❌ У вас нет доступа.", show_alert=True)
             elif data.startswith("admin_set_activation_keys:"):
                 if db_user.is_admin:
                     # Формат: admin_set_activation_keys:{user_id}:{change}
@@ -898,6 +906,23 @@ class VPNBot:
                     user_id = int(parts[1])
                     limit = int(parts[2])
                     await self._handle_admin_set_limit(update, context, db_user, user_id, limit)
+                else:
+                    await query.answer("❌ У вас нет доступа.", show_alert=True)
+            elif data.startswith("admin_grant_keys:"):
+                if db_user.is_admin:
+                    # Формат: admin_grant_keys:user_id:count
+                    parts = data.split(":")
+                    target_user_id = int(parts[1])
+                    count = int(parts[2])
+                    await self._handle_admin_grant_keys(update, context, db_user, target_user_id, count)
+                else:
+                    await query.answer("❌ У вас нет доступа.", show_alert=True)
+            elif data.startswith("admin_reject_keys:"):
+                if db_user.is_admin:
+                    # Формат: admin_reject_keys:user_id
+                    parts = data.split(":")
+                    target_user_id = int(parts[1])
+                    await self._handle_admin_reject_keys(update, context, db_user, target_user_id)
                 else:
                     await query.answer("❌ У вас нет доступа.", show_alert=True)
             elif data.startswith("admin_delete_user:"):
@@ -960,114 +985,33 @@ class VPNBot:
 
         db = get_db_session()
         try:
-            # Для администратора всегда разрешаем создание ключа без ограничений оплаты/активации.
-            if db_user.is_admin:
-                successful_payments = []
-                is_free_user = True
-                is_paid_user = False
-                total_available_codes = 1  # фиктивное положительное значение, чтобы не сработали проверки
-                payment_with_codes = None
-            else:
-                # Проверяем, является ли пользователь платным (имеет успешные платежи) или бесплатным (активирован администратором)
-                # Ищем успешные платежи типа qr_subscription
-                successful_payments = db.query(Payment).filter(
-                    Payment.user_id == db_user.id,
-                    Payment.status == 'success',
-                    Payment.payment_type == 'qr_subscription'
-                ).all()
-            
-                # Подсчитываем доступные QR-коды из успешных платежей
-                total_available_codes = 0
-                for payment in successful_payments:
-                    # Подсчитываем, сколько ключей уже создано из этого платежа
-                    keys_from_payment = db.query(VPNKey).filter(
-                        VPNKey.payment_id == payment.id,
-                        VPNKey.is_active == True
-                    ).count()
-                    # Доступные коды = купленные минус созданные
-                    available = payment.qr_code_count - keys_from_payment
-                    total_available_codes += max(0, available)
-                
-                # Проверяем, есть ли у пользователя бесплатный доступ (активирован администратором)
-                is_free_user = db_user.is_active and db_user.max_keys > 0
-                
-                # Если есть успешные платежи - это платный пользователь
-                is_paid_user = len(successful_payments) > 0
-            
-            if is_paid_user:
-                # ПЛАТНЫЙ ПОЛЬЗОВАТЕЛЬ - проверяем доступные коды из платежей
-                if total_available_codes <= 0:
-                    await query.answer("❌ У вас нет доступных QR-кодов.", show_alert=True)
-                    # Показываем пояснение и меню покупки
-                    explanation_text = (
-                        "❌ Достигнут лимит ключей.\n\n"
-                        "Все купленные QR-коды уже использованы для создания ключей.\n"
-                        "Для создания дополнительных ключей необходимо приобрести новые QR-коды.\n\n"
-                        "Выберите количество кодов и период подписки:"
-                    )
-                    await self._safe_edit_message_text(query, text=explanation_text)
-                    # Показываем меню покупки
-                    await self._show_purchase_menu(update, context)
-                    return
-                
-                # Находим платеж с доступными кодами
-                payment_with_codes = None
-                for payment in successful_payments:
-                    keys_from_payment = db.query(VPNKey).filter(
-                        VPNKey.payment_id == payment.id,
-                        VPNKey.is_active == True
-                    ).count()
-                    if payment.qr_code_count - keys_from_payment > 0:
-                        payment_with_codes = payment
-                        break
-                
-                if not payment_with_codes:
-                    await query.message.reply_text(
-                        "❌ Не удалось найти доступный платеж для создания ключа."
-                    )
-                    return
-                
-            elif is_free_user:
-                # БЕСПЛАТНЫЙ ПОЛЬЗОВАТЕЛЬ - проверяем лимит ключей
-                # Подсчитываем только бесплатные ключи (access_type='free' или None)
+            # Администратору всегда разрешаем создание ключа без ограничений.
+            if not db_user.is_admin:
+                # Для обычного пользователя проверяем лимит активных ключей.
                 active_keys_count = db.query(VPNKey).filter(
                     VPNKey.user_id == db_user.id,
-                    VPNKey.is_active == True
-                ).filter(
-                    (VPNKey.access_type == 'free') | (VPNKey.access_type.is_(None))
+                    VPNKey.is_active == True,
                 ).count()
-                
-                if active_keys_count >= db_user.max_keys and not db_user.is_admin:
+
+                if active_keys_count >= db_user.max_keys:
                     await query.answer(f"❌ Достигнут лимит ключей ({db_user.max_keys}).", show_alert=True)
-                    # Предлагаем докупить еще ключей
+                    # Сообщение и варианты действий (удалить ключи / вернуться в меню).
                     text = (
-                        f"❌ Достигнут лимит бесплатных ключей ({db_user.max_keys}/{db_user.max_keys}).\n\n"
-                        "Вы использовали все доступные бесплатные ключи.\n"
-                        "Для создания дополнительных ключей необходимо приобрести QR-коды.\n\n"
+                        f"❌ Достигнут лимит ключей ({active_keys_count}/{db_user.max_keys}).\n\n"
+                        "Вы использовали все доступные ключи.\n\n"
                         "Вы можете:\n"
-                        "• 💳 Докупить дополнительные QR-коды (платно)\n"
-                        "• 🗑 Удалить один из существующих ключей и создать новый бесплатно"
+                        "• 🗑 Удалить один из существующих ключей и создать новый\n"
+                        "• 📩 Запросить увеличение лимита ключей у администратора\n"
+                        "• ◀️ Вернуться в главное меню"
                     )
                     keyboard = [
-                        [InlineKeyboardButton("💳 Докупить QR-коды", callback_data="purchase_menu")],
                         [InlineKeyboardButton("📋 Мои ключи", callback_data="my_keys")],
-                        [InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")]
+                        [InlineKeyboardButton("📩 Запросить ещё ключи", callback_data="request_more_keys")],
+                        [InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")],
                     ]
                     reply_markup = InlineKeyboardMarkup(keyboard)
                     await self._safe_edit_message_text(query, text=text, reply_markup=reply_markup)
                     return
-                payment_with_codes = None
-            else:
-                # Пользователь не имеет ни платного, ни бесплатного доступа
-                reply_keyboard = self._get_reply_keyboard()
-                await query.message.reply_text(
-                    "❌ У вас нет доступа для создания ключа.\n\n"
-                    "Вы можете:\n"
-                    "• 💳 Купить доступ через меню \"💳 Оплатить VPN\"\n"
-                    "• 🔓 Запросить активацию у администратора",
-                    reply_markup=reply_keyboard
-                )
-                return
 
             # Генерируем имя ключа с информацией о пользователе
             # Формат: имя_телефон_дата_ID
@@ -1148,7 +1092,7 @@ class VPNBot:
                 await msg.edit_text(error_msg, reply_markup=reply_keyboard)
                 return
 
-            # Сохраняем в БД с правильной привязкой к платежу
+            # Сохраняем в БД
             vpn_key = VPNKey(
                 user_id=db_user.id,
                 key_name=key_name,
@@ -1159,13 +1103,13 @@ class VPNBot:
                 public_key=vpn_data['public_key'],
                 private_key=vpn_data['private_key'],  # В продакшене лучше зашифровать
                 is_active=True,
-                created_by_bot=True,  # Ключ создан через бота
-                access_type='paid' if is_paid_user else 'free',  # Тип доступа
-                payment_id=payment_with_codes.id if payment_with_codes else None,  # Привязка к платежу для платных
-                purchase_date=payment_with_codes.paid_at if payment_with_codes else datetime.now(),
-                subscription_period_days=payment_with_codes.subscription_period_days if payment_with_codes else None,
-                expires_at=payment_with_codes.expires_at if payment_with_codes else None,
-                is_test=False
+                created_by_bot=True,
+                access_type='free',
+                payment_id=None,
+                purchase_date=None,
+                subscription_period_days=None,
+                expires_at=None,
+                is_test=False,
             )
             db.add(vpn_key)
             db.commit()
@@ -1254,10 +1198,26 @@ class VPNBot:
                 created_date = key.created_at.strftime("%d.%m.%Y %H:%M")
                 last_used = f"\nИспользован: {key.last_used.strftime('%d.%m.%Y %H:%M')}" if key.last_used else ""
 
+                # Определяем online/offline по last_handshake
+                status_line = ""
+                try:
+                    status = await vpn_manager.get_peer_status_async(
+                        public_key=key.public_key,
+                        client_ip=key.client_ip,
+                    )
+                    last_hs = status.get("last_handshake") if status else 0
+                    if last_hs:
+                        from time import time as _time
+                        online = (_time() - last_hs) <= 180
+                        status_line = f"Статус: {'🟢 online' if online else '⚪️ offline'}\n"
+                except Exception as e:
+                    logger.warning(f"Failed to get status for key {key.id}: {e}")
+
                 text += (
                     f"🔑 {key.key_name}\n"
                     f"Протокол: {key.protocol}\n"
-                    f"Создан: {created_date}{last_used}\n\n"
+                    f"Создан: {created_date}{last_used}\n"
+                    f"{status_line}\n"
                 )
 
                 # Сокращаем имя ключа для кнопки (максимум 25 символов)
@@ -1268,9 +1228,13 @@ class VPNBot:
                 
                 keyboard.append([
                     InlineKeyboardButton(
+                        f"📊 Статистика {key_display_name}",
+                        callback_data=f"key_stats:{key.id}",
+                    ),
+                    InlineKeyboardButton(
                         f"🗑 Удалить {key_display_name}",
-                        callback_data=f"delete_key:{key.id}"
-                    )
+                        callback_data=f"delete_key:{key.id}",
+                    ),
                 ])
 
             keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")])
@@ -1418,6 +1382,7 @@ class VPNBot:
                 [InlineKeyboardButton("⚙️ Настройки приложения", callback_data="admin_settings")],
                 [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
                 [InlineKeyboardButton("🔄 Синхронизировать ключи", callback_data="admin_sync_keys")],
+                [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
                 [InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1427,6 +1392,76 @@ class VPNBot:
         except Exception as e:
             logger.error(f"Error in admin panel: {e}", exc_info=True)
             await query.message.reply_text("❌ Произошла ошибка.")
+        finally:
+            db.close()
+
+    async def _handle_admin_broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
+        """Запрос текста рассылки от администратора."""
+        query = update.callback_query
+        await query.answer()
+
+        context.user_data['admin_broadcast_waiting_text'] = True
+        context.user_data.pop('admin_broadcast_text', None)
+
+        text = (
+            "📢 Рассылка пользователям\n\n"
+            "Отправьте текст сообщения, которое будет разослано всем активным пользователям.\n\n"
+            "После этого вы увидите предпросмотр и сможете подтвердить отправку."
+        )
+        keyboard = [
+            [InlineKeyboardButton("◀️ Назад", callback_data="admin_back")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await self._safe_edit_message_text(query, text=text, reply_markup=reply_markup)
+
+    async def _handle_admin_broadcast_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
+        """Отмена режима рассылки."""
+        query = update.callback_query
+        await query.answer()
+        context.user_data.pop('admin_broadcast_waiting_text', None)
+        context.user_data.pop('admin_broadcast_text', None)
+        # Возвращаемся в админ-панель
+        await self._handle_admin_panel(update, context, db_user)
+
+    async def _handle_admin_broadcast_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
+        """Отправка рассылки всем активным пользователям."""
+        query = update.callback_query
+        await query.answer()
+
+        text = context.user_data.get('admin_broadcast_text')
+        if not text:
+            await query.answer("❌ Текст рассылки не найден. Повторите попытку.", show_alert=True)
+            return
+
+        db = get_db_session()
+        try:
+            users = db.query(User).filter(
+                User.telegram_id.isnot(None),
+                User.is_active == True,
+            ).all()
+
+            success = 0
+            failed = 0
+            for user in users:
+                try:
+                    await context.bot.send_message(chat_id=user.telegram_id, text=text)
+                    success += 1
+                except Exception as e:
+                    logger.warning(f"Broadcast to {user.telegram_id} failed: {e}")
+                    failed += 1
+
+            context.user_data.pop('admin_broadcast_text', None)
+
+            result_text = (
+                "📢 Рассылка завершена.\n\n"
+                f"✅ Успешно: {success}\n"
+                f"⚠️ Ошибок: {failed}"
+            )
+            keyboard = [
+                [InlineKeyboardButton("◀️ В админ-панель", callback_data="admin_panel")],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await self._safe_edit_message_text(query, text=result_text, reply_markup=reply_markup)
         finally:
             db.close()
 
@@ -1837,6 +1872,121 @@ class VPNBot:
         finally:
             db.close()
 
+    async def _handle_user_key_stats(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        db_user: User,
+        key_id: int,
+        period: str = "month",
+    ):
+        """Статистика и статус VPN ключа для пользователя."""
+        query = update.callback_query
+        await query.answer()
+
+        db = get_db_session()
+        try:
+            key = db.query(VPNKey).filter(
+                VPNKey.id == key_id,
+                VPNKey.user_id == db_user.id,
+            ).first()
+            if not key:
+                await query.answer("❌ Ключ не найден.", show_alert=True)
+                return
+
+            # Live-статус с сервера
+            status = await vpn_manager.get_peer_status_async(
+                public_key=key.public_key,
+                client_ip=key.client_ip,
+            )
+
+            from datetime import date, timedelta, datetime as _dt
+
+            now_ts = int(_dt.utcnow().timestamp())
+            if status and status.get("last_handshake"):
+                last_hs = int(status.get("last_handshake") or 0)
+                last_handshake_str = _dt.utcfromtimestamp(last_hs).strftime("%d.%m.%Y %H:%M:%S UTC")
+                online = (now_ts - last_hs) <= 180
+            else:
+                last_hs = 0
+                last_handshake_str = "никогда"
+                online = False
+
+            rx_live = int(status.get("rx_bytes", 0)) if status else 0
+            tx_live = int(status.get("tx_bytes", 0)) if status else 0
+
+            # Исторический трафик за период
+            today = date.today()
+            if period == "day":
+                since_date = today
+                period_title = "за сегодня"
+            elif period == "week":
+                since_date = today - timedelta(days=7)
+                period_title = "за последние 7 дней"
+            else:
+                since_date = today - timedelta(days=30)
+                period_title = "за последние 30 дней"
+
+            stats = db.query(TrafficStatistics).filter(
+                TrafficStatistics.vpn_key_id == key.id,
+                TrafficStatistics.date >= since_date,
+            ).all()
+
+            total_rx_hist = sum(s.bytes_received for s in stats)
+            total_tx_hist = sum(s.bytes_sent for s in stats)
+
+            def _fmt_bytes(val: int) -> str:
+                units = ["B", "KiB", "MiB", "GiB"]
+                v = float(val)
+                for unit in units:
+                    if v < 1024.0 or unit == units[-1]:
+                        return f"{v:.1f} {unit}"
+                    v /= 1024.0
+                return f"{v:.1f} GiB"
+
+            text = (
+                "📊 Статистика VPN ключа\n\n"
+                f"🔑 {key.key_name}\n"
+                f"IP: {key.client_ip or 'не задан'}\n\n"
+                f"Статус: {'🟢 online' if online else '⚪️ offline'}\n"
+                f"Последний handshake: {last_handshake_str}\n\n"
+                f"Текущая сессия:\n"
+                f"• Входящий трафик (rx): {_fmt_bytes(rx_live)}\n"
+                f"• Исходящий трафик (tx): {_fmt_bytes(tx_live)}\n\n"
+                f"Трафик {period_title} (по снэпшотам):\n"
+                f"• Входящий (rx): {_fmt_bytes(total_rx_hist)}\n"
+                f"• Исходящий (tx): {_fmt_bytes(total_tx_hist)}\n"
+            )
+
+            # Кнопки выбора периода
+            period_buttons = [
+                InlineKeyboardButton(
+                    "📅 День" + (" ✅" if period == "day" else ""),
+                    callback_data=f"key_stats_period:{key.id}:day",
+                ),
+                InlineKeyboardButton(
+                    "📅 Неделя" + (" ✅" if period == "week" else ""),
+                    callback_data=f"key_stats_period:{key.id}:week",
+                ),
+                InlineKeyboardButton(
+                    "📅 Месяц" + (" ✅" if period == "month" else ""),
+                    callback_data=f"key_stats_period:{key.id}:month",
+                ),
+            ]
+
+            keyboard = [
+                period_buttons,
+                [InlineKeyboardButton("◀️ Назад к моим ключам", callback_data="my_keys")],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.message.reply_text(text=text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"Error getting user key stats: {e}", exc_info=True)
+            await query.answer("❌ Ошибка при получении статистики.", show_alert=True)
+        finally:
+            db.close()
+
     async def _handle_admin_sync_keys(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
         """Синхронизация ключей с сервером"""
         query = update.callback_query
@@ -2148,236 +2298,8 @@ class VPNBot:
         else:
             await update.message.reply_text(f"❌ Ошибка при добавлении настройки `{setting_key}`", parse_mode='Markdown')
 
-    async def _show_donation_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
-        """Показ меню выбора суммы доната"""
-        query = update.callback_query
-        await query.answer()
-        
-        text = (
-            "💚 Поддержать проект\n\n"
-            "Ваша поддержка помогает поддерживать работу VPN сервера для друзей администратора.\n\n"
-            "⚠️ Минимальная сумма: 250 ₽\n"
-            "➕ Комиссия: 2%\n\n"
-            "Выберите сумму пожертвования:"
-        )
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("250 ₽", callback_data="donation_amount:250"),
-            ],
-            [
-                InlineKeyboardButton("500 ₽", callback_data="donation_amount:500"),
-            ],
-            [
-                InlineKeyboardButton("1000 ₽", callback_data="donation_amount:1000"),
-            ],
-            [
-                InlineKeyboardButton("💵 Другая сумма", callback_data="donation_custom"),
-            ],
-            [
-                InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"),
-            ],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await self._safe_edit_message_text(query, text=text, reply_markup=reply_markup)
-    
-    async def _handle_donation_payment(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User, amount: int):
-        """Обработка оплаты доната с выбранной суммой"""
-        query = update.callback_query
-        await query.answer()
-        
-        db = get_db_session()
-        try:
-            # Генерируем платежную ссылку через Flask сервер
-            payment_data = {
-                'user_id': db_user.id,
-                'amount': amount,
-                'description': f'Пожертвование на поддержку VPN сервера от {db_user.nickname or db_user.first_name or db_user.username or f"user_{db_user.telegram_id}"}',
-                'payment_type': 'donation'
-            }
-            
-            try:
-                # Вызываем Flask сервер для генерации платежной ссылки (с retry)
-                response = await self._make_http_request_with_retry(
-                    'POST',
-                    f"{WEB_SERVER_URL}/generate_payment_uri",
-                    json=payment_data,
-                    timeout=30
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    payment_url = result.get('payment_url')
-                    payment_label = result.get('payment_label')
-                    
-                    # Сохраняем payment_id для проверки баланса
-                    context.user_data['payment_id'] = result.get('payment_id')
-                    context.user_data['payment_label'] = payment_label
-                    context.user_data['payment_amount'] = amount
-                    
-                    text = (
-                        f"💚 Пожертвование на поддержку проекта\n\n"
-                        f"Сумма: {amount} ₽\n"
-                        f"➕ Комиссия (2%): {result.get('commission', 0):.2f} ₽\n"
-                        f"💰 Итого к оплате: {result.get('amount_with_commission', amount):.2f} ₽\n\n"
-                        f"Спасибо за вашу поддержку! 🙏\n\n"
-                        f"Нажмите на кнопку ниже, чтобы перейти к оплате:"
-                    )
-                    
-                    keyboard = [
-                        [InlineKeyboardButton("💳 Оплатить", url=payment_url)],
-                        [InlineKeyboardButton("✅ Проверить баланс", callback_data="check_payment_balance")],
-                        [InlineKeyboardButton("◀️ Назад к выбору суммы", callback_data="pay_vpn")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    
-                    await self._safe_edit_message_text(query, text=text, reply_markup=reply_markup)
-                else:
-                    logger.error(f"Failed to generate payment URL: {response.status_code}, {response.text}")
-                    reply_keyboard = self._get_reply_keyboard()
-                    await query.message.reply_text(
-                        "❌ Ошибка при создании платежной ссылки. Попробуйте позже или обратитесь к администратору.",
-                        reply_markup=reply_keyboard
-                    )
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Error connecting to payment server: {e}")
-                reply_keyboard = self._get_reply_keyboard()
-                await query.message.reply_text(
-                    "❌ Сервис оплаты временно недоступен. Попробуйте позже или обратитесь к администратору.",
-                    reply_markup=reply_keyboard
-                )
-        finally:
-            db.close()
-    
-    async def _handle_custom_donation(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
-        """Обработка запроса на ввод произвольной суммы доната"""
-        query = update.callback_query
-        await query.answer()
-        
-        text = (
-            "💵 Введите сумму пожертвования\n\n"
-            "Отправьте сумму в рублях (например: 150 или 2500)\n"
-            "Минимальная сумма: 10 ₽\n"
-            "Максимальная сумма: 100000 ₽\n\n"
-            "Или нажмите кнопку ниже, чтобы вернуться к выбору суммы:"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("◀️ Назад к выбору суммы", callback_data="pay_vpn")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await self._safe_edit_message_text(query, text=text, reply_markup=reply_markup)
-        
-        # Устанавливаем состояние ожидания ввода суммы
-        context.user_data['waiting_for_donation_amount'] = True
-    
-    async def _handle_donation_amount_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User, text: str):
-        """Обработка ввода произвольной суммы доната"""
-        try:
-            # Парсим сумму
-            amount = int(text.strip())
-            
-            # Проверяем диапазон
-            reply_keyboard = self._get_reply_keyboard()
-            if amount < 10:
-                await update.message.reply_text(
-                    "❌ Минимальная сумма пожертвования: 10 ₽\n\n"
-                    "Пожалуйста, введите сумму от 10 до 100000 ₽:",
-                    reply_markup=reply_keyboard
-                )
-                return
-            
-            if amount > 100000:
-                await update.message.reply_text(
-                    "❌ Максимальная сумма пожертвования: 100000 ₽\n\n"
-                    "Пожалуйста, введите сумму от 10 до 100000 ₽:",
-                    reply_markup=reply_keyboard
-                )
-                return
-            
-            # Убираем флаг ожидания
-            context.user_data.pop('waiting_for_donation_amount', None)
-            
-            # Обрабатываем платеж
-            await self._handle_donation_payment_message(update, context, db_user, amount)
-            
-        except ValueError:
-            reply_keyboard = self._get_reply_keyboard()
-            await update.message.reply_text(
-                "❌ Неверный формат суммы.\n\n"
-                "Пожалуйста, введите число (например: 150 или 2500):",
-                reply_markup=reply_keyboard
-            )
-        except Exception as e:
-            logger.error(f"Error handling donation amount input: {e}", exc_info=True)
-            reply_keyboard = self._get_reply_keyboard()
-            await update.message.reply_text(
-                "❌ Произошла ошибка при обработке суммы. Попробуйте еще раз или выберите сумму из меню.",
-                reply_markup=reply_keyboard
-            )
-            context.user_data.pop('waiting_for_donation_amount', None)
-    
-    async def _handle_donation_payment_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User, amount: int):
-        """Обработка оплаты доната (вызывается из текстового сообщения)"""
-        db = get_db_session()
-        try:
-            # Генерируем платежную ссылку через Flask сервер
-            payment_data = {
-                'user_id': db_user.id,
-                'amount': amount,
-                'description': f'Пожертвование на поддержку VPN сервера от {db_user.nickname or db_user.first_name or db_user.username or f"user_{db_user.telegram_id}"}',
-                'payment_type': 'donation'
-            }
-            
-            try:
-                # Вызываем Flask сервер для генерации платежной ссылки (с retry)
-                response = await self._make_http_request_with_retry(
-                    'POST',
-                    f"{WEB_SERVER_URL}/generate_payment_uri",
-                    json=payment_data,
-                    timeout=30
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    payment_url = result.get('payment_url')
-                    payment_label = result.get('payment_label')
-                    
-                    text = (
-                        f"💚 Пожертвование на поддержку проекта\n\n"
-                        f"Сумма: {amount} ₽\n"
-                        f"➕ Комиссия (2%): {result.get('commission', 0):.2f} ₽\n"
-                        f"💰 Итого к оплате: {result.get('amount_with_commission', amount):.2f} ₽\n\n"
-                        f"Спасибо за вашу поддержку! 🙏\n\n"
-                        f"Нажмите на кнопку ниже, чтобы перейти к оплате:"
-                    )
-                    
-                    keyboard = [
-                        [InlineKeyboardButton("💳 Оплатить", url=payment_url)],
-                        [InlineKeyboardButton("✅ Проверить баланс", callback_data="check_payment_balance")],
-                        [InlineKeyboardButton("◀️ Назад к выбору суммы", callback_data="pay_vpn")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    
-                    await update.message.reply_text(text=text, reply_markup=reply_markup)
-                else:
-                    logger.error(f"Failed to generate payment URL: {response.status_code}, {response.text}")
-                    reply_keyboard = self._get_reply_keyboard()
-                    await update.message.reply_text(
-                        "❌ Ошибка при создании платежной ссылки. Попробуйте позже или обратитесь к администратору.",
-                        reply_markup=reply_keyboard
-                    )
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Error connecting to payment server: {e}")
-                reply_keyboard = self._get_reply_keyboard()
-                await update.message.reply_text(
-                    "❌ Сервис оплаты временно недоступен. Попробуйте позже или обратитесь к администратору.",
-                    reply_markup=reply_keyboard
-                )
-        finally:
-            db.close()
+    # Платёжные обработчики (донаты/подписки) отключены и удалены, так как оплата VPN
+    # больше не используется в боте. Исторический код сохранён в git-истории.
     
     async def _show_inactive_user_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
         """Показ меню для неактивных пользователей"""
@@ -2399,7 +2321,6 @@ class VPNBot:
         text = (
             "⚠️ Ваш аккаунт неактивен\n\n"
             "Выберите действие:\n"
-            "• 💳 Купить доступ - приобрести VPN ключи"
         )
         
         if db_user.activation_requested:
@@ -2409,10 +2330,8 @@ class VPNBot:
         
         text += "\n• 📱 Предоставить телефон - для автоверификации"
         
-        keyboard = [
-            [InlineKeyboardButton("💳 Купить доступ", callback_data="purchase_menu")],
-        ]
-        
+        keyboard = []
+
         if db_user.activation_requested:
             # Запрос уже отправлен - показываем только кнопку "Назад"
             keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_inactive_menu")])
@@ -2558,12 +2477,10 @@ class VPNBot:
             text = (
                 "🔓 Запрос активации аккаунта\n\n"
                 "Ваш запрос на активацию отправлен администратору.\n"
-                "После активации вы получите уведомление.\n\n"
-                "Вы также можете купить доступ, чтобы получить VPN ключи сразу."
+                "После активации вы получите уведомление."
             )
             
             keyboard = [
-                [InlineKeyboardButton("💳 Купить доступ", callback_data="purchase_menu")],
                 [InlineKeyboardButton("◀️ Назад", callback_data="back_to_inactive_menu")],
             ]
             
@@ -2638,198 +2555,14 @@ class VPNBot:
         )
 
     async def _show_purchase_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показ меню покупки QR-кодов для неавторизованных пользователей"""
-        # Получаем текущие значения из user_data или устанавливаем по умолчанию
-        months = context.user_data.get('purchase_months', 1)
-        codes = context.user_data.get('purchase_codes', 1)
-        
-        # Ограничиваем значения
-        months = max(1, min(months, 12))
-        codes = max(1, min(codes, 5))
-        
-        # Сохраняем в user_data
-        context.user_data['purchase_months'] = months
-        context.user_data['purchase_codes'] = codes
-        
-        # Рассчитываем цену
-        price_info = price_calculator.calculate_price(codes, months)
-        total_price = int(price_info['total'])
-        
-        # Формируем текст сообщения
-        month_word = price_calculator._get_month_word(months)
-        code_word = price_calculator._get_code_word(codes)
-        
-        text = (
-            f"💳 Покупка QR-кодов\n\n"
-            f"📅 Период подписки: [−] {months} {month_word} [+]\n\n"
-            f"📦 Количество кодов: [−] {codes} {code_word} [+]\n\n"
-            f"💰 Сумма к оплате: {total_price}₽\n\n"
-            f"{price_calculator.format_price_info(codes, months)}"
-        )
-        
-        # Формируем клавиатуру
-        keyboard = [
-            # Строка с кнопками для месяцев
-            [
-                InlineKeyboardButton("−", callback_data="purchase_months:-"),
-                InlineKeyboardButton(f"📅 {months} {month_word}", callback_data="purchase_info"),
-                InlineKeyboardButton("+", callback_data="purchase_months:+")
-            ],
-            # Строка с кнопками для кодов
-            [
-                InlineKeyboardButton("−", callback_data="purchase_codes:-"),
-                InlineKeyboardButton(f"📦 {codes} {code_word}", callback_data="purchase_info"),
-                InlineKeyboardButton("+", callback_data="purchase_codes:+")
-            ],
-            # Кнопка оплаты
-            [InlineKeyboardButton(f"💳 Оплатить {total_price}₽", callback_data="purchase_pay")],
-            # Кнопка назад
-            [InlineKeyboardButton("◀️ Назад", callback_data="back_to_inactive_menu")]
-        ]
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        """[DEPRECATED] Платёжное меню отключено, оставлено для совместимости callback'ов."""
+        query = update.callback_query
+        await query.answer()
         reply_keyboard = self._get_reply_keyboard()
-        
-        # Проверяем, откуда вызывается (callback или message)
-        if update.callback_query:
-            await self._safe_edit_message_text(update.callback_query, text=text, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(text=text, reply_markup=reply_markup)
-            # Показываем постоянную клавиатуру с кнопкой меню
-            await update.message.reply_text(
-                "Используйте кнопку ниже для быстрого доступа к меню:",
-                reply_markup=reply_keyboard
-            )
-    
-    async def _handle_purchase_months(self, update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
-        """Обработка изменения количества месяцев"""
-        query = update.callback_query
-        await query.answer()
-        
-        current_months = context.user_data.get('purchase_months', 1)
-        
-        if action == "+":
-            current_months = min(current_months + 1, 12)
-        elif action == "-":
-            current_months = max(current_months - 1, 1)
-        
-        context.user_data['purchase_months'] = current_months
-        
-        # Показываем обновленное меню
-        await self._show_purchase_menu(update, context)
-    
-    async def _handle_purchase_codes(self, update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
-        """Обработка изменения количества кодов"""
-        query = update.callback_query
-        await query.answer()
-        
-        current_codes = context.user_data.get('purchase_codes', 1)
-        
-        if action == "+":
-            current_codes = min(current_codes + 1, 5)
-        elif action == "-":
-            current_codes = max(current_codes - 1, 1)
-        
-        context.user_data['purchase_codes'] = current_codes
-        
-        # Показываем обновленное меню
-        await self._show_purchase_menu(update, context)
-    
-    async def _handle_purchase_pay(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка перехода к оплате"""
-        query = update.callback_query
-        user = update.effective_user
-        
-        # Получаем параметры покупки
-        months = context.user_data.get('purchase_months', 1)
-        codes = context.user_data.get('purchase_codes', 1)
-        
-        # Рассчитываем цену
-        price_info = price_calculator.calculate_price(codes, months)
-        total_price = int(price_info['total'])
-        
-        # Создаем или находим пользователя в БД (может быть неавторизованным)
-        db = get_db_session()
-        try:
-            db_user = db.query(User).filter(User.telegram_id == user.id).first()
-            
-            if not db_user:
-                # Создаем временного пользователя для платежа (НЕ активируем до успешной оплаты)
-                db_user = User(
-                    telegram_id=user.id,
-                    username=user.username,
-                    first_name=user.first_name or "Неавторизованный",
-                    last_name=user.last_name,
-                    is_active=False,  # НЕ активен до успешной оплаты
-                    max_keys=0  # Лимит ключей будет установлен после успешной оплаты через webhook
-                )
-                db.add(db_user)
-                db.commit()
-                db.refresh(db_user)
-            
-            # Генерируем платежную ссылку
-            subscription_days = months * 30  # Приблизительно
-            
-            payment_data = {
-                'user_id': db_user.id,
-                'amount': total_price,
-                'description': f'Покупка {codes} QR-код(ов) на {months} месяц(ев)',
-                'payment_type': 'qr_subscription',
-                'qr_code_count': codes,
-                'subscription_period_days': subscription_days
-            }
-            
-            try:
-                # Вызываем Flask сервер для генерации платежной ссылки (с retry)
-                response = await self._make_http_request_with_retry(
-                    'POST',
-                    f"{WEB_SERVER_URL}/generate_payment_uri",
-                    json=payment_data,
-                    timeout=30
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    payment_url = result.get('payment_url')
-                    payment_label = result.get('payment_label')
-                    
-                    # Сохраняем параметры покупки в user_data для дальнейшего использования
-                    context.user_data['purchase_payment_label'] = payment_label
-                    context.user_data['purchase_months'] = months
-                    context.user_data['purchase_codes'] = codes
-                    
-                    month_word = price_calculator._get_month_word(months)
-                    code_word = price_calculator._get_code_word(codes)
-                    
-                    text = (
-                        f"💳 Оплата QR-кодов\n\n"
-                        f"📦 Количество кодов: {codes} {code_word}\n"
-                        f"📅 Период подписки: {months} {month_word}\n"
-                        f"💰 Сумма к оплате: {total_price}₽\n\n"
-                        f"После успешной оплаты вы получите QR-код{'и' if codes > 1 else ''} для настройки VPN.\n\n"
-                        f"Нажмите на кнопку ниже, чтобы перейти к оплате:"
-                    )
-                    
-                    keyboard = [
-                        [InlineKeyboardButton("💳 Оплатить", url=payment_url)],
-                        [InlineKeyboardButton("✅ Проверить баланс", callback_data="check_payment_balance")],
-                        [InlineKeyboardButton("◀️ Назад к выбору", callback_data="purchase_menu")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    
-                    await self._safe_edit_message_text(query, text=text, reply_markup=reply_markup)
-                else:
-                    logger.error(f"Failed to generate payment URL: {response.status_code}, {response.text}")
-                    await query.message.reply_text(
-                        "❌ Ошибка при создании платежной ссылки. Попробуйте позже или обратитесь к администратору."
-                    )
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Error connecting to payment server: {e}")
-                await query.message.reply_text(
-                    "❌ Сервис оплаты временно недоступен. Попробуйте позже или обратитесь к администратору."
-                )
-        finally:
-            db.close()
+        await query.message.reply_text(
+            "🔒 Платежи отключены. Для доступа к VPN обратитесь к администратору.",
+            reply_markup=reply_keyboard,
+        )
     
     async def _handle_admin_set_activation_keys(self, update: Update, context: ContextTypes.DEFAULT_TYPE, admin_user: User, target_user_id: int, change: str):
         """Изменение количества ключей при активации пользователя"""
@@ -2899,6 +2632,118 @@ class VPNBot:
             await self._safe_edit_message_text(query, text=admin_text, reply_markup=admin_reply_markup)
         finally:
             db.close()
+
+    async def _handle_admin_grant_keys(self, update: Update, context: ContextTypes.DEFAULT_TYPE, admin_user: User, target_user_id: int, count: int):
+        """Одобрение запроса на увеличение лимита ключей."""
+        query = update.callback_query
+        await query.answer()
+
+        db = get_db_session()
+        try:
+            user = db.query(User).filter(User.id == target_user_id).first()
+            if not user:
+                await query.answer("❌ Пользователь не найден.", show_alert=True)
+                return
+
+            user.max_keys = (user.max_keys or 0) + count
+            db.commit()
+
+            # Уведомляем пользователя
+            if user.telegram_id:
+                try:
+                    keys_text = "ключ" if user.max_keys == 1 else "ключа" if user.max_keys < 5 else "ключей"
+                    await context.bot.send_message(
+                        chat_id=user.telegram_id,
+                        text=(
+                            "✅ Ваш запрос на увеличение лимита ключей одобрен.\n\n"
+                            f"Новый лимит: {user.max_keys} {keys_text}."
+                        ),
+                        reply_markup=self._get_reply_keyboard(),
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending grant-keys notification: {e}")
+
+            await self._safe_edit_message_text(
+                query,
+                text=f"✅ Лимит ключей пользователя ID={user.id} увеличен на {count}. Текущий лимит: {user.max_keys}.",
+            )
+        finally:
+            db.close()
+
+    async def _handle_admin_reject_keys(self, update: Update, context: ContextTypes.DEFAULT_TYPE, admin_user: User, target_user_id: int):
+        """Отклонение запроса на увеличение лимита ключей."""
+        query = update.callback_query
+        await query.answer()
+
+        db = get_db_session()
+        try:
+            user = db.query(User).filter(User.id == target_user_id).first()
+            if not user:
+                await query.answer("❌ Пользователь не найден.", show_alert=True)
+                return
+
+            # Уведомляем пользователя
+            if user.telegram_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=user.telegram_id,
+                        text="❌ Ваш запрос на увеличение лимита ключей отклонен. При необходимости свяжитесь с администратором.",
+                        reply_markup=self._get_reply_keyboard(),
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending reject-keys notification: {e}")
+
+            await self._safe_edit_message_text(
+                query,
+                text=f"❌ Запрос на увеличение лимита ключей для пользователя ID={user.id} отклонен.",
+            )
+        finally:
+            db.close()
+    async def _handle_request_more_keys(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
+        """Запрос пользователя на увеличение лимита ключей."""
+        query = update.callback_query
+        await query.answer()
+
+        # Сообщение пользователю
+        await query.message.reply_text(
+            "📩 Ваш запрос на увеличение лимита ключей отправлен администратору.\n\n"
+            "Ожидайте ответа.",
+            reply_markup=self._get_reply_keyboard(),
+        )
+
+        # Уведомление администратору
+        try:
+            display_name = self._get_user_display_name_with_username(db_user)
+        except Exception:
+            display_name = db_user.first_name or db_user.username or f"user{db_user.telegram_id}"
+
+        text = (
+            "📩 Запрос на увеличение лимита ключей\n\n"
+            f"Пользователь: {display_name}\n"
+            f"Текущий лимит ключей: {db_user.max_keys}\n\n"
+            "Выберите, на сколько увеличить лимит:"
+        )
+
+        keyboard = [
+            [
+                InlineKeyboardButton("➕ +1", callback_data=f"admin_grant_keys:{db_user.id}:1"),
+                InlineKeyboardButton("➕ +3", callback_data=f"admin_grant_keys:{db_user.id}:3"),
+                InlineKeyboardButton("➕ +5", callback_data=f"admin_grant_keys:{db_user.id}:5"),
+            ],
+            [
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_reject_keys:{db_user.id}"),
+            ],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=text,
+                reply_markup=reply_markup,
+            )
+        except Exception as e:
+            logger.error(f"Error sending more-keys request to admin: {e}")
     
     async def _handle_admin_activate_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE, admin_user: User, target_user_id: int, keys_count: int = 1):
         """Активация пользователя администратором с указанным количеством ключей"""
@@ -2967,7 +2812,7 @@ class VPNBot:
                     reply_keyboard = self._get_reply_keyboard()
                     await context.bot.send_message(
                         chat_id=target_user.telegram_id,
-                        text="❌ Ваш запрос на активацию отклонен. Вы можете купить доступ или обратиться к администратору.",
+                        text="❌ Ваш запрос на активацию отклонен. Вы можете повторно запросить активацию или обратиться к администратору.",
                         reply_markup=reply_keyboard
                     )
                 except Exception as e:
@@ -2986,16 +2831,33 @@ class VPNBot:
         query = update.callback_query
 
         text = (
-            "ℹ️ Помощь\n\n"
-            "Этот бот позволяет управлять VPN ключами для AmneziaWG.\n\n"
-            "Основные функции:\n"
-            "• 🔐 Создание VPN ключей\n"
-            "• 💳 Оплата VPN доступа\n"
-            "• 📋 Просмотр ваших ключей\n"
-            "• 🗑 Удаление ключей\n\n"
-            "Для создания ключа нажмите \"🔐 Получить AmneziaWG ключ\".\n"
-            "После создания вы получите файл конфигурации и QR-код для быстрой настройки.\n\n"
-            "Если возникли вопросы, обратитесь к администратору."
+            "🔐 Помощь и настройка AmneziaWG\n\n"
+            "Этот бот создан для управления ключами AmneziaWG.\n\n"
+            "Что умеет бот:\n"
+            "• 🔐 Создавать ключи доступа\n"
+            "• 📋 Показывать ваши ключи\n"
+            "• 🗑 Удалять ключи\n"
+            "• 📊 Показывать статус и статистику трафика по ключам\n\n"
+            "🚀 Быстрый старт\n\n"
+            "Шаг 1. Скачайте приложение AmneziaVPN\n"
+            "Выберите нужную версию:\n"
+            "• 📱 Для iPhone/iPad: AmneziaVPN в App Store — https://apps.apple.com/us/app/amneziavpn/id1600529900\n"
+            "• 🤖 Для Android: AmneziaVPN в Google Play — https://play.google.com/store/apps/details?id=org.amnezia.vpn\n"
+            "• 💻 Другие платформы и APK: официальный сайт — https://amnezia.org\n\n"
+            "Шаг 2. Получите ключ\n"
+            "Нажмите кнопку «🔐 Получить AmneziaWG ключ» в меню бота.\n"
+            "Бот создаст для вас VPN‑ключ и пришлёт файл конфигурации (.conf), а также QR‑код.\n\n"
+            "Шаг 3. Добавьте ключ в приложение\n"
+            "Самый простой способ — использовать QR‑код:\n"
+            "1) Откройте приложение AmneziaVPN.\n"
+            "2) Нажмите «Добавить соединение» (или значок +).\n"
+            "3) Выберите «Добавить по QR‑коду».\n"
+            "4) Наведите камеру на QR‑код из бота.\n"
+            "5) Нажмите на ползунок, чтобы подключиться.\n\n"
+            "Альтернативный способ:\n"
+            "1) Сохраните полученный файл .conf на устройство.\n"
+            "2) В AmneziaVPN выберите «Импорт из файла» и укажите этот файл.\n\n"
+            "Если возникли вопросы или сложности с подключением, обратитесь к администратору."
         )
 
         keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")]]
