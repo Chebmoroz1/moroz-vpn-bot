@@ -456,6 +456,7 @@ class VPNManager:
 PrivateKey = {private_key}
 Address = {client_ip}/32
 DNS = 1.1.1.1, 8.8.8.8
+MTU = 1280
 
 [Peer]
 PublicKey = {server_public_key}
