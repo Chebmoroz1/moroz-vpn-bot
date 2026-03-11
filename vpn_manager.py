@@ -360,6 +360,84 @@ class VPNManager:
         """Получение endpoint сервера"""
         return f"{self.server_host}:{self.vpn_port}"
 
+    def get_awg_params_from_server(self) -> Dict[str, str]:
+        """
+        Получение AmneziaWG параметров (Jc/Jmin/Jmax/S1/S2/H1–H4) с сервера.
+
+        Пытается прочитать /opt/amnezia/awg/wg0.conf внутри Docker-контейнера.
+        Возвращает словарь с найденными параметрами или пустой словарь при ошибке.
+        """
+        params: Dict[str, str] = {}
+        try:
+            # Читаем конфиг AmneziaWG внутри контейнера
+            config_path = "/opt/amnezia/awg/wg0.conf"
+            command = f"sed -n '1,80p' {config_path}"
+            stdout, stderr, exit_code = self._exec_command(
+                command,
+                docker_exec=True,
+            )
+
+            if exit_code != 0:
+                logger.warning(
+                    f"Failed to read AWG config {config_path}. "
+                    f"Exit code: {exit_code}, stderr: {stderr}"
+                )
+                return params
+
+            for line in stdout.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = [part.strip() for part in line.split("=", 1)]
+                if key in {"Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"}:
+                    params[key] = value
+
+            if params:
+                logger.info(
+                    "AWG params loaded from server: "
+                    + ", ".join(f"{k}={v}" for k, v in params.items())
+                )
+            else:
+                logger.warning(
+                    "AWG params not found in wg0.conf. "
+                    "Client configs will be generated without Jc/Jmin/Jmax/S*/H*."
+                )
+
+            return params
+
+        except Exception as e:
+            logger.error(f"Failed to get AWG params from server: {e}", exc_info=True)
+            return params
+
+    def _generate_psk(self) -> Optional[str]:
+        """
+        Генерация PresharedKey на сервере (wg genpsk внутри контейнера).
+        Возвращает строку PSK или None при ошибке.
+        """
+        try:
+            logger.info("Generating PresharedKey via server")
+            stdout, stderr, exit_code = self._exec_command(
+                f"{self.wg_path} genpsk",
+                docker_exec=True,
+            )
+            if exit_code != 0:
+                logger.warning(
+                    f"Failed to generate PresharedKey on server. "
+                    f"Exit code: {exit_code}, stderr: {stderr}"
+                )
+                return None
+
+            psk = stdout.strip()
+            if not psk:
+                logger.warning("Generated PresharedKey is empty")
+                return None
+
+            logger.debug("PresharedKey generated successfully")
+            return psk
+        except Exception as e:
+            logger.error(f"Error generating PresharedKey: {e}", exc_info=True)
+            return None
+
     def get_next_available_ip(self) -> Optional[str]:
         """Получение следующего доступного IP адреса"""
         # Получаем список используемых IP
@@ -455,21 +533,53 @@ class VPNManager:
         logger.error(f"Failed to remove peer: {stderr}")
         return False
 
-    def generate_config(self, private_key: str, client_ip: str, server_public_key: str) -> str:
+    def generate_config(
+        self,
+        private_key: str,
+        client_ip: str,
+        server_public_key: str,
+        preshared_key: Optional[str] = None,
+    ) -> str:
         """Генерация конфигурационного файла AmneziaWG"""
-        config = f"""[Interface]
-PrivateKey = {private_key}
-Address = {client_ip}/32
-DNS = 1.1.1.1, 8.8.8.8
-MTU = 1280
+        # Пытаемся получить параметры AmneziaWG (Jc/Jmin/Jmax/S1/S2/H1–H4)
+        awg_params = self.get_awg_params_from_server()
 
-[Peer]
-PublicKey = {server_public_key}
-Endpoint = {self.get_server_endpoint()}
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
-"""
-        return config
+        lines = [
+            "[Interface]",
+            f"PrivateKey = {private_key}",
+            f"Address = {client_ip}/32",
+            # Используем такой же DNS, как в рабочем Amnezia-конфиге
+            "DNS = 1.1.1.1, 1.0.0.1",
+            "MTU = 1280",
+        ]
+
+        # Добавляем AWG-параметры, если удалось их прочитать с сервера
+        for key in ["Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"]:
+            if key in awg_params:
+                lines.append(f"{key} = {awg_params[key]}")
+
+        lines.extend(
+            [
+                "",
+                "[Peer]",
+                f"PublicKey = {server_public_key}",
+            ]
+        )
+
+        if preshared_key:
+            lines.append(f"PresharedKey = {preshared_key}")
+
+        lines.extend(
+            [
+                f"Endpoint = {self.get_server_endpoint()}",
+                # Включаем и IPv4, и IPv6, как в рабочем iOS-конфиге
+                "AllowedIPs = 0.0.0.0/0, ::/0",
+                "PersistentKeepalive = 25",
+                "",
+            ]
+        )
+
+        return "\n".join(lines)
 
     def save_config_file(self, key_name: str, config_content: str, overwrite: bool = False) -> Path:
         """
@@ -558,19 +668,31 @@ PersistentKeepalive = 25
 
             logger.info(f"Server public key retrieved: {server_public_key[:20]}...")
 
-            # 4. Добавляем peer на сервер
+            # 4. Генерируем PresharedKey (опционально)
+            preshared_key = self._generate_psk()
+            if preshared_key:
+                logger.info("PresharedKey generated and will be used for this peer")
+            else:
+                logger.info("PresharedKey not generated; peer will be created without PSK")
+
+            # 5. Добавляем peer на сервер
             logger.info(f"Adding peer to server: {public_key[:20]}... with IP {client_ip}")
             allowed_ips = f"{client_ip}/32"
-            if not self.add_peer(public_key, allowed_ips):
+            if not self.add_peer(public_key, allowed_ips, preshared_key=preshared_key):
                 logger.error("Failed to add peer to server")
                 raise Exception("Не удалось добавить peer на сервер")
 
             logger.info("Peer added successfully")
 
-            # 5. Генерируем конфигурацию
-            config_content = self.generate_config(private_key, client_ip, server_public_key)
+            # 6. Генерируем конфигурацию
+            config_content = self.generate_config(
+                private_key,
+                client_ip,
+                server_public_key,
+                preshared_key=preshared_key,
+            )
 
-            # 6. Сохраняем файл конфигурации
+            # 7. Сохраняем файл конфигурации
             # Проверка: существует ли уже конфигурация?
             config_file_path = VPN_CONFIGS_DIR / f"{key_name}.conf"
             if not config_file_path.exists():
@@ -582,7 +704,7 @@ PersistentKeepalive = 25
                 config_path = config_file_path
                 logger.info(f"Config file already exists, preserving: {config_path}")
 
-            # 7. Генерируем QR-код
+            # 8. Генерируем QR-код
             qr_path = self.generate_qr_code(key_name, config_path)
             if qr_path:
                 logger.info(f"QR code generated: {qr_path}")
