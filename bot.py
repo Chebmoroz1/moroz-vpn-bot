@@ -16,7 +16,6 @@ from telegram.ext import (
 from telegram.error import BadRequest, TimedOut, NetworkError, Conflict
 
 from config import BOT_TOKEN, ADMIN_ID, VPN_CONFIGS_DIR, WEB_SERVER_URL
-from ml_cloud_payment_flow import get_payment_flow
 from database import init_db, get_db_session, User, VPNKey, Payment
 from sqlalchemy import func
 from contacts import contacts_manager
@@ -217,8 +216,9 @@ class VPNBot:
             db_user.is_admin = (user.id == ADMIN_ID)
             db.commit()
 
-            # Проверяем активность
-            if not db_user.is_active:
+            # Проверяем активность: для админа всегда разрешаем доступ в главное меню,
+            # даже если is_active=False.
+            if not db_user.is_active and not db_user.is_admin:
                 # Показываем меню для неактивных пользователей
                 await self._show_inactive_user_menu(update, context, db_user)
                 return
@@ -417,8 +417,8 @@ class VPNBot:
             if updated:
                 db.commit()
             
-            # Проверяем активность
-            if not db_user.is_active:
+            # Проверяем активность: для админа сразу ведем в главное меню
+            if not db_user.is_active and not db_user.is_admin:
                 # Убираем клавиатуру с номером телефона
                 await update.message.reply_text(
                     "✅ Данные обновлены!",
@@ -478,8 +478,8 @@ class VPNBot:
                     # Если пользователь не найден, создаем его
                     await self._request_phone_number(update, context)
                     return
-                elif not db_user.is_active:
-                    # Показываем меню для неактивных пользователей
+                elif not db_user.is_active and not db_user.is_admin:
+                    # Показываем меню для неактивных пользователей (кроме админа)
                     await self._show_inactive_user_menu(update, context, db_user)
                     return
                 else:
@@ -741,7 +741,7 @@ class VPNBot:
             db = get_db_session()
             try:
                 db_user = db.query(User).filter(User.telegram_id == user_id).first()
-                if db_user and not db_user.is_active:
+                if db_user and not db_user.is_active and not db_user.is_admin:
                     await self._show_inactive_user_menu(update, context, db_user)
                 else:
                     await self._show_purchase_menu(update, context)
@@ -757,7 +757,7 @@ class VPNBot:
                 # Если пользователь не найден, показываем меню покупки
                 await self._show_purchase_menu(update, context)
                 return
-            elif not db_user.is_active:
+            elif not db_user.is_active and not db_user.is_admin:
                 # Если пользователь неактивен, обрабатываем специальные действия
                 if data == "request_activation":
                     await self._handle_request_activation(update, context, db_user)
@@ -954,31 +954,39 @@ class VPNBot:
 
         db = get_db_session()
         try:
-            # Проверяем, является ли пользователь платным (имеет успешные платежи) или бесплатным (активирован администратором)
-            # Ищем успешные платежи типа qr_subscription
-            successful_payments = db.query(Payment).filter(
-                Payment.user_id == db_user.id,
-                Payment.status == 'success',
-                Payment.payment_type == 'qr_subscription'
-            ).all()
+            # Для администратора всегда разрешаем создание ключа без ограничений оплаты/активации.
+            if db_user.is_admin:
+                successful_payments = []
+                is_free_user = True
+                is_paid_user = False
+                total_available_codes = 1  # фиктивное положительное значение, чтобы не сработали проверки
+                payment_with_codes = None
+            else:
+                # Проверяем, является ли пользователь платным (имеет успешные платежи) или бесплатным (активирован администратором)
+                # Ищем успешные платежи типа qr_subscription
+                successful_payments = db.query(Payment).filter(
+                    Payment.user_id == db_user.id,
+                    Payment.status == 'success',
+                    Payment.payment_type == 'qr_subscription'
+                ).all()
             
-            # Подсчитываем доступные QR-коды из успешных платежей
-            total_available_codes = 0
-            for payment in successful_payments:
-                # Подсчитываем, сколько ключей уже создано из этого платежа
-                keys_from_payment = db.query(VPNKey).filter(
-                    VPNKey.payment_id == payment.id,
-                    VPNKey.is_active == True
-                ).count()
-                # Доступные коды = купленные минус созданные
-                available = payment.qr_code_count - keys_from_payment
-                total_available_codes += max(0, available)
-            
-            # Проверяем, есть ли у пользователя бесплатный доступ (активирован администратором)
-            is_free_user = db_user.is_active and db_user.max_keys > 0
-            
-            # Если есть успешные платежи - это платный пользователь
-            is_paid_user = len(successful_payments) > 0
+                # Подсчитываем доступные QR-коды из успешных платежей
+                total_available_codes = 0
+                for payment in successful_payments:
+                    # Подсчитываем, сколько ключей уже создано из этого платежа
+                    keys_from_payment = db.query(VPNKey).filter(
+                        VPNKey.payment_id == payment.id,
+                        VPNKey.is_active == True
+                    ).count()
+                    # Доступные коды = купленные минус созданные
+                    available = payment.qr_code_count - keys_from_payment
+                    total_available_codes += max(0, available)
+                
+                # Проверяем, есть ли у пользователя бесплатный доступ (активирован администратором)
+                is_free_user = db_user.is_active and db_user.max_keys > 0
+                
+                # Если есть успешные платежи - это платный пользователь
+                is_paid_user = len(successful_payments) > 0
             
             if is_paid_user:
                 # ПЛАТНЫЙ ПОЛЬЗОВАТЕЛЬ - проверяем доступные коды из платежей
@@ -1023,7 +1031,7 @@ class VPNBot:
                     (VPNKey.access_type == 'free') | (VPNKey.access_type.is_(None))
                 ).count()
                 
-                if active_keys_count >= db_user.max_keys:
+                if active_keys_count >= db_user.max_keys and not db_user.is_admin:
                     await query.answer(f"❌ Достигнут лимит ключей ({db_user.max_keys}).", show_alert=True)
                     # Предлагаем докупить еще ключей
                     text = (
@@ -1846,9 +1854,9 @@ class VPNBot:
 
         text = "⚙️ Настройки приложения\n\nВыберите категорию настроек:"
 
+        # Только актуальные категории: Telegram / VPN / Общие
         keyboard = [
             [InlineKeyboardButton("📱 Telegram", callback_data="admin_settings_category:telegram")],
-            [InlineKeyboardButton("💳 YooMoney", callback_data="admin_settings_category:yoomoney")],
             [InlineKeyboardButton("🔐 VPN", callback_data="admin_settings_category:vpn")],
             [InlineKeyboardButton("🌐 Общие", callback_data="admin_settings_category:general")],
             [InlineKeyboardButton("◀️ Назад", callback_data="admin_back")]
@@ -1866,9 +1874,8 @@ class VPNBot:
         
         category_names = {
             'telegram': '📱 Telegram',
-            'yoomoney': '💳 YooMoney',
             'vpn': '🔐 VPN',
-            'general': '🌐 Общие'
+            'general': '🌐 Общие',
         }
         
         text = f"{category_names.get(category, category)} - Настройки\n\n"
@@ -1895,33 +1902,13 @@ class VPNBot:
         else:
             text += "Настроек в этой категории пока нет.\n\n"
         
-        # Добавляем кнопку для добавления настройки (только если это не yoomoney, там только CLIENT_ID)
-        if category != 'yoomoney':
-            keyboard.append([InlineKeyboardButton("➕ Добавить настройку", callback_data=f"admin_setting_add:{category}")])
-        
-        # Шаблоны для популярных настроек (показываем только если настройка еще не добавлена)
-        if category == 'yoomoney':
-            existing_keys = [s['key'] for s in settings] if settings else []
-            
-            # Шаблоны доступных настроек
-            templates = [
-                ('YMONEY_CLIENT_ID', 'ID приложения YooMoney', '⚠️ Обязательная настройка'),
-                ('YMONEY_WALLET', 'Номер кошелька YooMoney', '💡 Опционально (для QuickPay)'),
-            ]
-            
-            # Показываем только те шаблоны, которых еще нет
-            new_templates = [t for t in templates if t[0] not in existing_keys]
-            
-            if new_templates:
-                text += "\n📋 Доступные настройки:\n\n"
-                for key, desc, note in new_templates:
-                    text += f"{note}\n"
-                    keyboard.append([
-                        InlineKeyboardButton(
-                            f"➕ {desc}",
-                            callback_data=f"admin_setting_add_template:{category}:{key}"
-                        )
-                    ])
+        # Кнопка добавления новой настройки
+        keyboard.append([
+            InlineKeyboardButton(
+                "➕ Добавить настройку",
+                callback_data=f"admin_setting_add:{category}"
+            )
+        ])
         
         keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_settings")])
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1953,7 +1940,6 @@ class VPNBot:
         """Обработка нового значения настройки"""
         categories = {
             'BOT_TOKEN': ('telegram', 'Токен Telegram бота'),
-            'YMONEY_CLIENT_ID': ('yoomoney', 'YooMoney Client ID'),
             'WEB_SERVER_DOMAIN': ('general', 'Домен веб-сервера'),
         }
         
@@ -1998,7 +1984,7 @@ class VPNBot:
             f"Отправьте в формате:\n"
             f"`ключ=значение`\n\n"
             f"Пример:\n"
-            f"`YMONEY_CLIENT_ID=ED3F92226A61D36D60400C8DF4E3E89064A597DA345FE9E286741685E5154B2E`\n\n"
+            f"`BOT_TOKEN=123456789:ABC...`\n\n"
             f"Или отправьте просто ключ, затем бот попросит ввести значение."
         )
         
@@ -2016,8 +2002,6 @@ class VPNBot:
         query = update.callback_query
         
         templates = {
-            'YMONEY_CLIENT_ID': ('yoomoney', 'ID приложения YooMoney', False),
-            'YMONEY_WALLET': ('yoomoney', 'Номер кошелька YooMoney', False),
             'BOT_TOKEN': ('telegram', 'Токен Telegram бота', True),
             'WEB_SERVER_DOMAIN': ('general', 'Домен веб-сервера', False),
         }
