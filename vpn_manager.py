@@ -1,4 +1,5 @@
 """Управление VPN (AmneziaWG через SSH/Docker)"""
+import base64
 import subprocess
 import secrets
 import ipaddress
@@ -6,7 +7,7 @@ import re
 import asyncio
 import socket
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from paramiko import SSHClient, AutoAddPolicy
 from config import (
@@ -438,6 +439,102 @@ class VPNManager:
             logger.error(f"Error generating PresharedKey: {e}", exc_info=True)
             return None
 
+    # ========== AmneziaWG CONFIG FILE MANAGEMENT ==========
+    # wg set on AmneziaWG userspace (wireguard-go) resets AWG obfuscation
+    # params (Jc/Jmin/Jmax/S1/S2/H1-H4) to zero. To preserve them we must
+    # modify wg0.conf and apply it atomically via wg syncconf.
+
+    AWG_CONFIG_PATH = "/opt/amnezia/awg/wg0.conf"
+
+    def _read_server_config(self) -> str:
+        """Read the AmneziaWG config file from the Docker container."""
+        stdout, stderr, exit_code = self._exec_command(
+            f"cat {self.AWG_CONFIG_PATH}", docker_exec=True,
+        )
+        if exit_code != 0:
+            raise Exception(f"Failed to read server config: {stderr}")
+        return stdout
+
+    def _write_server_config(self, content: str) -> None:
+        """Write content to the AmneziaWG config file inside the container.
+
+        Uses base64 encoding to avoid shell escaping issues.
+        """
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        command = (
+            f"echo '{encoded}' | base64 -d > /tmp/wg0_new.conf "
+            f"&& mv /tmp/wg0_new.conf {self.AWG_CONFIG_PATH}"
+        )
+        stdout, stderr, exit_code = self._exec_command(command, docker_exec=True)
+        if exit_code != 0:
+            raise Exception(f"Failed to write server config: {stderr}")
+
+    def _apply_server_config(self) -> None:
+        """Apply wg0.conf via wg syncconf (preserves AWG obfuscation params)."""
+        command = (
+            f"wg-quick strip {self.AWG_CONFIG_PATH} > /tmp/awg_stripped.conf "
+            f"&& {self.wg_path} syncconf {self.vpn_interface} /tmp/awg_stripped.conf "
+            f"&& rm -f /tmp/awg_stripped.conf"
+        )
+        stdout, stderr, exit_code = self._exec_command(command, docker_exec=True)
+        if exit_code != 0:
+            raise Exception(f"Failed to apply config via syncconf: {stderr}")
+        logger.info("Config applied via wg syncconf (AWG params preserved)")
+
+    @staticmethod
+    def _parse_config_sections(config_text: str) -> Tuple[List[str], List[Dict[str, str]]]:
+        """Parse a WireGuard/AmneziaWG config into interface lines and peer dicts.
+
+        Returns:
+            (interface_lines, peers) where each peer is a dict with raw
+            key-value pairs (including PublicKey, PresharedKey, AllowedIPs).
+        """
+        interface_lines: List[str] = []
+        peers: List[Dict[str, str]] = []
+        current_section: Optional[str] = None
+        current_peer: Dict[str, str] = {}
+
+        for raw_line in config_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == "[Interface]":
+                current_section = "interface"
+                continue
+            if line == "[Peer]":
+                if current_section == "peer" and current_peer:
+                    peers.append(current_peer)
+                current_section = "peer"
+                current_peer = {}
+                continue
+            if "=" in line:
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if current_section == "interface":
+                    interface_lines.append(raw_line)
+                elif current_section == "peer":
+                    current_peer[key] = value
+
+        if current_section == "peer" and current_peer:
+            peers.append(current_peer)
+
+        return interface_lines, peers
+
+    @staticmethod
+    def _build_config(interface_lines: List[str], peers: List[Dict[str, str]]) -> str:
+        """Reconstruct a WireGuard/AmneziaWG config from parsed components."""
+        lines = ["[Interface]"]
+        lines.extend(interface_lines)
+        for peer in peers:
+            lines.append("")
+            lines.append("[Peer]")
+            for key in ("PublicKey", "PresharedKey", "AllowedIPs"):
+                if key in peer:
+                    lines.append(f"{key} = {peer[key]}")
+        lines.append("")
+        return "\n".join(lines)
+
     def get_next_available_ip(self) -> Optional[str]:
         """Получение следующего доступного IP адреса"""
         # Получаем список используемых IP
@@ -473,65 +570,83 @@ class VPNManager:
 
     def add_peer(self, public_key: str, allowed_ips: str, preshared_key: Optional[str] = None) -> bool:
         """
-        Добавление peer на сервер
-        :param public_key: Публичный ключ клиента
-        :param allowed_ips: Разрешенные IP адреса (например, 10.8.1.2/32)
-        :param preshared_key: Pre-shared key (опционально)
-        :return: True если успешно
+        Добавление peer на сервер через модификацию wg0.conf + wg syncconf.
+
+        Использование ``wg set`` на AmneziaWG userspace (wireguard-go) сбрасывает
+        параметры обфускации (Jc/Jmin/Jmax/S1/S2/H1-H4) в 0, что ломает
+        подключение клиентов с AWG-конфигом (в частности, iOS).  Поэтому мы
+        редактируем файл конфигурации и применяем его через ``wg syncconf``.
         """
-        # Базовая команда для добавления peer
-        if preshared_key:
-            # Для pre-shared key используем временный файл
-            command = (
-                f"echo '{preshared_key}' | "
-                f"{self.wg_path} set {self.vpn_interface} peer {public_key} allowed-ips {allowed_ips} preshared-key /dev/stdin"
-            )
-        else:
-            command = f"{self.wg_path} set {self.vpn_interface} peer {public_key} allowed-ips {allowed_ips}"
-        
-        stdout, stderr, exit_code = self._exec_command(command, docker_exec=True)
-        
-        if exit_code == 0:
-            logger.info(f"Peer added successfully via wg set")
-            
-            # Для AmneziaWG конфигурация может сохраняться автоматически
-            # Но можно попробовать явно сохранить через wg-quick (если доступен)
-            # Ошибка сохранения не критична, так как для AmneziaWG wg set достаточно
-            save_command = f"wg-quick save {self.vpn_interface} 2>/dev/null || true"
-            save_stdout, save_stderr, save_exit = self._ssh_exec(save_command, docker_exec=True)
-            
-            if save_exit == 0:
-                logger.info("Configuration saved via wg-quick")
+        try:
+            config_text = self._read_server_config()
+            iface_lines, peers = self._parse_config_sections(config_text)
+
+            # Проверяем, нет ли уже такого peer
+            for p in peers:
+                if p.get("PublicKey") == public_key:
+                    logger.warning(f"Peer {public_key[:30]}... already exists, updating")
+                    p["AllowedIPs"] = allowed_ips
+                    if preshared_key:
+                        p["PresharedKey"] = preshared_key
+                    break
             else:
-                logger.debug(f"wg-quick save not available (expected for AmneziaWG): {save_stderr}")
-            
+                new_peer: Dict[str, str] = {
+                    "PublicKey": public_key,
+                    "AllowedIPs": allowed_ips,
+                }
+                if preshared_key:
+                    new_peer["PresharedKey"] = preshared_key
+                peers.append(new_peer)
+
+            new_config = self._build_config(iface_lines, peers)
+            self._write_server_config(new_config)
+            self._apply_server_config()
+
             # Проверяем, что peer действительно добавлен
-            verify_stdout, verify_stderr, verify_exit = self._ssh_exec(
-                f"{self.wg_path} show {self.vpn_interface} dump", docker_exec=True
+            verify_stdout, _, verify_exit = self._exec_command(
+                f"{self.wg_path} show {self.vpn_interface} dump", docker_exec=True,
             )
             if verify_exit == 0 and public_key in verify_stdout:
                 logger.info(f"✅ Verified: peer {public_key[:30]}... is present on server")
             else:
                 logger.warning(f"⚠️ Warning: peer {public_key[:30]}... not found in dump after addition")
-            
+
             return True
-        
-        logger.error(f"Failed to add peer: {stderr}")
-        return False
+
+        except Exception as e:
+            logger.error(f"Failed to add peer: {e}", exc_info=True)
+            return False
 
     def remove_peer(self, public_key: str) -> bool:
-        """Удаление peer с сервера"""
-        command = f"{self.wg_path} set {self.vpn_interface} peer {public_key} remove"
-        stdout, stderr, exit_code = self._exec_command(command, docker_exec=True)
-        
-        if exit_code == 0:
-            # Сохраняем конфигурацию WireGuard
-            save_command = f"wg-quick save {self.vpn_interface}"
-            self._ssh_exec(save_command, docker_exec=True)
+        """Удаление peer с сервера через модификацию wg0.conf + wg syncconf."""
+        try:
+            config_text = self._read_server_config()
+            iface_lines, peers = self._parse_config_sections(config_text)
+
+            original_count = len(peers)
+            peers = [p for p in peers if p.get("PublicKey") != public_key]
+
+            if len(peers) == original_count:
+                logger.warning(f"Peer {public_key[:30]}... not found in config, trying wg set remove")
+                command = f"{self.wg_path} set {self.vpn_interface} peer {public_key} remove"
+                _, stderr, exit_code = self._exec_command(command, docker_exec=True)
+                if exit_code != 0:
+                    logger.error(f"Failed to remove peer via wg set: {stderr}")
+                    return False
+                # Re-apply AWG params that wg set might have reset
+                self._apply_server_config()
+                return True
+
+            new_config = self._build_config(iface_lines, peers)
+            self._write_server_config(new_config)
+            self._apply_server_config()
+
+            logger.info(f"Peer {public_key[:30]}... removed successfully")
             return True
-        
-        logger.error(f"Failed to remove peer: {stderr}")
-        return False
+
+        except Exception as e:
+            logger.error(f"Failed to remove peer: {e}", exc_info=True)
+            return False
 
     def generate_config(
         self,
