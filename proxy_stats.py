@@ -1,5 +1,6 @@
 """Статистика MTProxy: активные TCP-подключения на порт 8444 (на сервере, не в Docker)."""
 import logging
+import os
 import subprocess
 from typing import List, Tuple
 
@@ -8,6 +9,13 @@ from vpn_manager import vpn_manager
 logger = logging.getLogger(__name__)
 
 MTPROXY_PORT = 8444
+
+
+def _use_local_ss() -> bool:
+    """Решать, выполнять ли ss локально (без SSH). True если is_local или MTPROXY_USE_LOCAL=1."""
+    if os.environ.get("MTPROXY_USE_LOCAL", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    return vpn_manager.is_local
 
 
 def _run_ss_local(port: int) -> Tuple[str, str, int]:
@@ -29,17 +37,22 @@ def get_proxy_active_connection_ips(port: int = MTPROXY_PORT) -> Tuple[List[str]
     """
     Получить список уникальных IP клиентов с активными TCP-сессиями на порт прокси.
 
-    Если бот запущен на том же сервере, что и прокси (vpn_manager.is_local) —
-    выполняется локальный вызов ss без SSH. Иначе — через SSH на SERVER_HOST.
+    Если MTPROXY_USE_LOCAL=1 в окружении или vpn_manager.is_local — выполняется
+    локальный вызов ss без SSH. Иначе — через SSH на SERVER_HOST. При ошибке SSH
+    (например, нет ключа) делается повторная попытка локально.
 
     :param port: порт прокси (по умолчанию 8444)
     :return: (список IP, пустая строка или сообщение об ошибке)
     """
-    if vpn_manager.is_local:
+    if _use_local_ss():
         stdout, stderr, exit_code = _run_ss_local(port)
     else:
         cmd = f"ss -tn state established sport = :{port}"
         stdout, stderr, exit_code = vpn_manager._ssh_exec(cmd, docker_exec=False)
+        # Если SSH не удался из-за отсутствия ключа — пробуем локальный ss
+        if exit_code != 0 and "ключ не найден" in (stderr or "").lower():
+            logger.info("proxy_stats: SSH key missing, trying local ss")
+            stdout, stderr, exit_code = _run_ss_local(port)
 
     if exit_code != 0:
         err = stderr.strip() or f"exit code {exit_code}"

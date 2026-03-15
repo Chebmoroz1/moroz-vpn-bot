@@ -297,7 +297,7 @@ if FRONTEND_BUILD_DIR.exists():
     # Fallback для React Router - все остальные маршруты должны возвращать index.html
     # ВАЖНО: Этот маршрут должен быть определен ПОСЛЕ всех API endpoints!
 else:
-    # Если frontend не собран, возвращаем JSON
+    # Если frontend не собран, возвращаем JSON и ловим все не-API пути
     @app.get("/")
     async def root():
         """Главная страница - API info (frontend не собран)"""
@@ -305,6 +305,17 @@ else:
             "message": "VPN Bot Admin Panel API",
             "docs": "/docs",
             "note": "React frontend not built. Run 'cd web_admin/frontend && npm install && npm run build'"
+        }
+
+    @app.get("/{full_path:path}")
+    async def frontend_fallback(full_path: str):
+        """Чтобы не отдавать 404 на /proxy, /users и т.д. — отдаём ту же подсказку."""
+        if full_path.startswith("api") or full_path.startswith("docs") or full_path.startswith("openapi"):
+            raise HTTPException(status_code=404, detail="Not found")
+        return {
+            "message": "VPN Bot Admin Panel API",
+            "docs": "/docs",
+            "note": "React frontend not built. Run: cd web_admin/frontend && npm install && npm run build. Then restart vpn-web-admin."
         }
 
 
