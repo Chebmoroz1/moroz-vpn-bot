@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import './Traffic.css';
-import TrafficOverview from '../components/TrafficOverview';
-import TrafficUsersList from '../components/TrafficUsersList';
+import TrafficOverview from './TrafficOverview';
+import TrafficUsersList from './TrafficUsersList';
 
 const Traffic: React.FC = () => {
   const [loading, setLoading] = useState(true);
