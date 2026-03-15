@@ -281,9 +281,10 @@ def get_current_admin(request: Request, db: Session = Depends(get_db)) -> User:
 
 # Настройка статических файлов для React frontend
 FRONTEND_BUILD_DIR = Path(__file__).parent.parent / "frontend" / "build"
-if FRONTEND_BUILD_DIR.exists():
+FRONTEND_STATIC_DIR = FRONTEND_BUILD_DIR / "static"
+if FRONTEND_BUILD_DIR.exists() and FRONTEND_STATIC_DIR.exists():
     # Раздаем статические файлы (JS, CSS, images и т.д.)
-    app.mount("/static", StaticFiles(directory=str(FRONTEND_BUILD_DIR / "static")), name="static")
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_STATIC_DIR)), name="static")
     
     # Корневой эндпоинт для React frontend
     @app.get("/", response_class=HTMLResponse)
@@ -1466,7 +1467,7 @@ async def get_payment_stats(
 
 
 # Fallback для React Router - должен быть ПОСЛЕ всех API endpoints
-if FRONTEND_BUILD_DIR.exists():
+if FRONTEND_BUILD_DIR.exists() and FRONTEND_STATIC_DIR.exists():
     @app.get("/{full_path:path}", response_class=HTMLResponse)
     async def serve_frontend(full_path: str, request: Request):
         """Раздача React frontend для всех путей, кроме API"""
