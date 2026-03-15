@@ -133,3 +133,18 @@ export const paymentsApi = {
     api.get('/api/payments/stats', { params }),
 };
 
+export interface ProxyActiveConnection {
+  ip: string;
+  city: string | null;
+  provider: string | null;
+}
+
+export interface ProxyActiveResponse {
+  total: number;
+  connections: ProxyActiveConnection[];
+}
+
+export const proxyApi = {
+  getActive: () => api.get<ProxyActiveResponse>('/api/proxy/active'),
+};
+

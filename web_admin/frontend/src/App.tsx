@@ -7,6 +7,7 @@ import Users from './pages/Users';
 import Traffic from './pages/Traffic';
 import Keys from './pages/Keys';
 import Payments from './pages/Payments';
+import Proxy from './pages/Proxy';
 import Login from './pages/Login';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 
@@ -50,6 +51,7 @@ function AppRoutes() {
         <Route path="/traffic" element={<Traffic />} />
         <Route path="/keys" element={<Keys />} />
         <Route path="/payments" element={<Payments />} />
+        <Route path="/proxy" element={<Proxy />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Layout>

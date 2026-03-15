@@ -48,6 +48,11 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
             </Link>
           </li>
           <li>
+            <Link to="/proxy" className={isActive('/proxy') ? 'active' : ''}>
+              📡 MTProxy
+            </Link>
+          </li>
+          <li>
             <Link to="/payments" className={isActive('/payments') ? 'active' : ''}>
               💰 Оплаты
             </Link>

@@ -1,0 +1,100 @@
+.proxy-page {
+  padding: 24px;
+}
+
+.proxy-header {
+  margin-bottom: 24px;
+}
+
+.proxy-header h1 {
+  margin: 0 0 8px 0;
+  font-size: 1.5rem;
+}
+
+.proxy-subtitle {
+  color: #666;
+  margin: 0 0 16px 0;
+  font-size: 0.9rem;
+}
+
+.proxy-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.proxy-header-actions .last-update {
+  font-size: 0.85rem;
+  color: #888;
+}
+
+.proxy-header-actions .refresh-btn {
+  padding: 8px 16px;
+  background: #007bff;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.proxy-header-actions .refresh-btn:hover:not(:disabled) {
+  background: #0056b3;
+}
+
+.proxy-header-actions .refresh-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.proxy-error {
+  padding: 16px;
+  background: #f8d7da;
+  color: #721c24;
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.proxy-summary {
+  margin-bottom: 16px;
+  font-size: 1rem;
+}
+
+.proxy-empty {
+  padding: 24px;
+  text-align: center;
+  color: #888;
+}
+
+.proxy-table-wrap {
+  overflow-x: auto;
+  border-radius: 8px;
+  border: 1px solid #dee2e6;
+}
+
+.proxy-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.proxy-table th,
+.proxy-table td {
+  padding: 12px 16px;
+  text-align: left;
+  border-bottom: 1px solid #dee2e6;
+}
+
+.proxy-table th {
+  background: #f8f9fa;
+  font-weight: 600;
+}
+
+.proxy-table tbody tr:hover {
+  background: #f8f9fa;
+}
+
+.proxy-ip {
+  font-family: ui-monospace, monospace;
+}

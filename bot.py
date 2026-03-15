@@ -15,12 +15,16 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, TimedOut, NetworkError, Conflict
 
-from config import BOT_TOKEN, ADMIN_ID, VPN_CONFIGS_DIR, WEB_SERVER_URL
+from config import BOT_TOKEN, ADMIN_ID, VPN_CONFIGS_DIR, WEB_SERVER_URL, IPINFO_TOKEN
 from database import init_db, get_db_session, User, VPNKey, Payment, TrafficStatistics
 from sqlalchemy import func
 from contacts import contacts_manager
 from vpn_manager import vpn_manager
 from config_manager import config_manager
+from proxy_stats import get_proxy_active_connection_ips
+from ipinfo_client import IPinfoClient
+
+ipinfo_client = IPinfoClient(IPINFO_TOKEN) if IPINFO_TOKEN else None
 
 # Настройка логирования
 logging.basicConfig(
@@ -887,6 +891,11 @@ class VPNBot:
                     await self._handle_admin_stats(update, context, db_user)
                 else:
                     await query.answer("❌ У вас нет доступа.", show_alert=True)
+            elif data == "admin_proxy_stats":
+                if db_user.is_admin:
+                    await self._handle_admin_proxy_stats(update, context, db_user)
+                else:
+                    await query.answer("❌ У вас нет доступа.", show_alert=True)
             elif data.startswith("admin_user_page:"):
                 if db_user.is_admin:
                     page = int(data.split(":")[1])
@@ -1317,30 +1326,39 @@ class VPNBot:
                     'POST',
                     f"{web_admin_url}/api/auth/token",
                     json=token_request,
-                    timeout=15
+                    timeout=15,
                 )
-                
+
                 if response.status_code == 200:
                     result = response.json()
-                    token = result.get('token')
-                    expires_at = result.get('expires_at')
-                    
+                    # Поддерживаем оба варианта ответа: {token: ...} и {access_token: ...}
+                    token = result.get('token') or result.get('access_token')
+                    expires_at = result.get('expires_at') or "24 часа"
+
+                    if not token:
+                        logger.error(f"Admin web token is empty or None: {result}")
+                        await query.message.reply_text(
+                            "❌ Не удалось сгенерировать токен для веб-панели (пустой токен).\n"
+                            "Проверьте, что ваш Telegram ID занесён как администратор в базе,\n"
+                            "и что версии бота и веб-сервиса совпадают.",
+                        )
+                        return
+
                     # Формируем ссылку на веб-панель
                     web_panel_url = f"{web_admin_url}/?token={token}"
-                    
+
                     text = (
-                        f"🌐 Веб-панель администрирования\n\n"
-                        f"Токен действителен до: {expires_at}\n"
-                        f"(24 часа)\n\n"
-                        f"Нажмите на кнопку ниже, чтобы открыть веб-панель:"
+                        "🌐 Веб-панель администрирования\n\n"
+                        f"Токен действителен до: {expires_at}\n\n"
+                        "Нажмите на кнопку ниже, чтобы открыть веб-панель:"
                     )
-                    
+
                     keyboard = [
                         [InlineKeyboardButton("🌐 Открыть веб-панель", url=web_panel_url)],
-                        [InlineKeyboardButton("◀️ Назад", callback_data="admin_back")]
+                        [InlineKeyboardButton("◀️ Назад", callback_data="admin_back")],
                     ]
                     reply_markup = InlineKeyboardMarkup(keyboard)
-                    
+
                     await self._safe_edit_message_text(query, text=text, reply_markup=reply_markup)
                 else:
                     logger.error(f"Failed to generate web panel token: {response.status_code}, {response.text}")
@@ -1379,6 +1397,7 @@ class VPNBot:
                 [InlineKeyboardButton("🌐 Веб-панель", callback_data="admin_web_panel")],
                 [InlineKeyboardButton("👥 Управление пользователями", callback_data="admin_users")],
                 [InlineKeyboardButton("🔑 Все ключи", callback_data="admin_all_keys")],
+                [InlineKeyboardButton("📡 MTProxy (подключения)", callback_data="admin_proxy_stats")],
                 [InlineKeyboardButton("⚙️ Настройки приложения", callback_data="admin_settings")],
                 [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
                 [InlineKeyboardButton("🔄 Синхронизировать ключи", callback_data="admin_sync_keys")],
@@ -2089,6 +2108,53 @@ class VPNBot:
             await query.message.reply_text("❌ Произошла ошибка.")
         finally:
             db.close()
+
+    async def _handle_admin_proxy_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
+        """Активные TCP-подключения к MTProxy (порт 8444) с геолокацией."""
+        query = update.callback_query
+        await query.answer("⏳ Загрузка...")
+
+        try:
+            loop = asyncio.get_event_loop()
+            ips, err = await loop.run_in_executor(None, get_proxy_active_connection_ips)
+            if err:
+                text = f"📡 MTProxy — активные подключения\n\n❌ Не удалось получить данные с сервера:\n{err}"
+                keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="admin_back")]]
+                await self._safe_edit_message_text(query, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+                return
+
+            lines = []
+            max_lines = 30
+            for i, ip in enumerate(ips):
+                if i >= max_lines:
+                    lines.append(f"... и ещё {len(ips) - max_lines} подключений")
+                    break
+                city = ""
+                provider = ""
+                if ipinfo_client:
+                    geo = ipinfo_client.get_city_and_provider(ip)
+                    city = (geo.get("city") or "").strip()
+                    provider = (geo.get("provider") or "").strip()
+                loc = ", ".join(filter(None, [city, provider])) or "—"
+                lines.append(f"• {ip} — {loc}")
+
+            text = (
+                "📡 MTProxy — активные подключения (порт 8444)\n\n"
+                f"Всего: {len(ips)}\n\n"
+                + "\n".join(lines)
+            )
+            if len(text) > 4000:
+                text = text[:3970] + "\n\n... (обрезано)"
+
+            keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="admin_back")]]
+            await self._safe_edit_message_text(query, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            logger.error(f"Error in admin proxy stats: {e}", exc_info=True)
+            await self._safe_edit_message_text(
+                query,
+                text="📡 MTProxy\n\n❌ Произошла ошибка при получении данных.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_back")]]),
+            )
 
     async def _handle_admin_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
         """Главное меню настроек приложения"""

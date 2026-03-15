@@ -1,4 +1,5 @@
 """FastAPI backend для веб-панели администрирования"""
+import asyncio
 import os
 import logging
 import secrets
@@ -26,6 +27,7 @@ from database import SessionLocal, User, VPNKey, Payment, TrafficStatistics
 from sqlalchemy import func, and_
 from traffic_manager import traffic_manager
 from contacts import contacts_manager
+from proxy_stats import get_proxy_active_connection_ips
 from config import ADMIN_ID, BOT_TOKEN, WEB_SERVER_URL, YMONEY_CLIENT_ID, YMONEY_CLIENT_SECRET, YMONEY_REDIRECT_URI, YMONEY_WALLET, IPINFO_TOKEN
 from yoomoney_helper import YooMoneyHelper
 from config_manager import config_manager
@@ -193,6 +195,17 @@ class UserUpdateRequest(BaseModel):
     phone_number: Optional[str] = None
     is_active: Optional[bool] = None
     max_keys: Optional[int] = None
+
+
+class ProxyActiveConnection(BaseModel):
+    ip: str
+    city: Optional[str] = None
+    provider: Optional[str] = None
+
+
+class ProxyActiveResponse(BaseModel):
+    total: int
+    connections: List[ProxyActiveConnection]
 
 
 # Функция для генерации токена администратора
@@ -608,6 +621,33 @@ async def get_traffic_chart(
     return JSONResponse({
         period: [ChartDataPoint(**item).dict() for item in chart_data]
     })
+
+
+def _fetch_proxy_active_with_geo() -> tuple:
+    """Синхронно: получить IP активных подключений к MTProxy и обогатить геолокацией."""
+    ips, err = get_proxy_active_connection_ips()
+    if err:
+        return [], err
+    connections = []
+    for ip in ips:
+        city = ""
+        provider = ""
+        if ipinfo_client:
+            geo = ipinfo_client.get_city_and_provider(ip)
+            city = (geo.get("city") or "").strip() or None
+            provider = (geo.get("provider") or "").strip() or None
+        connections.append(ProxyActiveConnection(ip=ip, city=city, provider=provider))
+    return connections, None
+
+
+@app.get("/api/proxy/active", response_model=ProxyActiveResponse)
+async def get_proxy_active(admin: User = Depends(get_current_admin)):
+    """Активные TCP-подключения к MTProxy (порт 8444) с геолокацией."""
+    loop = asyncio.get_event_loop()
+    connections, err = await loop.run_in_executor(None, _fetch_proxy_active_with_geo)
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return ProxyActiveResponse(total=len(connections), connections=connections)
 
 
 @app.get("/api/keys", response_model=List[VPNKeyResponse])
