@@ -1,5 +1,6 @@
 """Статистика MTProxy: активные TCP-подключения на порт 8444 (на сервере, не в Docker)."""
 import logging
+import subprocess
 from typing import List, Tuple
 
 from vpn_manager import vpn_manager
@@ -9,18 +10,36 @@ logger = logging.getLogger(__name__)
 MTPROXY_PORT = 8444
 
 
+def _run_ss_local(port: int) -> Tuple[str, str, int]:
+    """Выполнить ss локально (когда бот и прокси на одном хосте)."""
+    cmd = ["ss", "-tn", "state", "established", f"sport = :{port}"]
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return r.stdout, r.stderr, r.returncode
+    except Exception as e:
+        return "", str(e), 1
+
+
 def get_proxy_active_connection_ips(port: int = MTPROXY_PORT) -> Tuple[List[str], str]:
     """
     Получить список уникальных IP клиентов с активными TCP-сессиями на порт прокси.
 
-    Выполняет на сервере: ss -tn state established sport = :8444
-    Парсит колонку Peer (client IP:port), возвращает уникальные IP.
+    Если бот запущен на том же сервере, что и прокси (vpn_manager.is_local) —
+    выполняется локальный вызов ss без SSH. Иначе — через SSH на SERVER_HOST.
 
     :param port: порт прокси (по умолчанию 8444)
     :return: (список IP, пустая строка или сообщение об ошибке)
     """
-    cmd = f"ss -tn state established sport = :{port}"
-    stdout, stderr, exit_code = vpn_manager._ssh_exec(cmd, docker_exec=False)
+    if vpn_manager.is_local:
+        stdout, stderr, exit_code = _run_ss_local(port)
+    else:
+        cmd = f"ss -tn state established sport = :{port}"
+        stdout, stderr, exit_code = vpn_manager._ssh_exec(cmd, docker_exec=False)
 
     if exit_code != 0:
         err = stderr.strip() or f"exit code {exit_code}"
