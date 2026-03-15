@@ -30,17 +30,19 @@ def get_proxy_active_connection_ips(port: int = MTPROXY_PORT) -> Tuple[List[str]
     ips = set()
     for line in stdout.strip().splitlines():
         line = line.strip()
-        if not line or line.startswith("State"):
+        if not line or "Address" in line and "Port" in line:
             continue
         parts = line.split()
-        # Формат: State Recv-Q Send-Q Local:Port Peer:Port
+        # Формат может быть: State Recv-Q Send-Q Local:Port Peer:Port (5+ колонок)
+        # или: Recv-Q Send-Q Local:Port Peer:Port (4 колонки)
+        peer = None
         if len(parts) >= 5:
             peer = parts[4]
-            if ":" in peer:
-                ip = peer.rsplit(":", 1)[0]
-                if ip and not ip.startswith("["):
-                    ips.add(ip)
-            else:
-                ips.add(peer)
+        elif len(parts) >= 4:
+            peer = parts[3]
+        if peer and ":" in peer:
+            ip = peer.rsplit(":", 1)[0].strip("[]")
+            if ip and ip != "0.0.0.0":
+                ips.add(ip)
 
     return sorted(ips), ""
