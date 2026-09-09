@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, TimedOut, NetworkError, Conflict
 
-from config import BOT_TOKEN, ADMIN_ID, VPN_CONFIGS_DIR, WEB_SERVER_URL, IPINFO_TOKEN
+from config import BOT_TOKEN, ADMIN_ID, VPN_CONFIGS_DIR, WEB_SERVER_URL, IPINFO_TOKEN, PWA_URL
 from database import init_db, get_db_session, User, VPNKey, Payment, TrafficStatistics
 from sqlalchemy import func
 from contacts import contacts_manager
@@ -715,6 +715,9 @@ class VPNBot:
             [InlineKeyboardButton("📋 Мои ключи", callback_data="my_keys")],
         ]
 
+        if PWA_URL:
+            keyboard.append([InlineKeyboardButton("🌐 Личный кабинет (PWA)", callback_data="pwa_link")])
+
         if db_user.is_admin:
             keyboard.append([InlineKeyboardButton("⚙️ Админ-панель", callback_data="admin_panel")])
 
@@ -786,6 +789,8 @@ class VPNBot:
                 await self._handle_request_more_keys(update, context, db_user)
             elif data == "back_to_menu":
                 await self._show_main_menu(update, context, db_user)
+            elif data == "pwa_link":
+                await self._handle_pwa_link(update, context, db_user)
             elif data == "admin_panel":
                 if db_user.is_admin:
                     await self._handle_admin_panel(update, context, db_user)
@@ -1307,6 +1312,49 @@ class VPNBot:
             await query.answer("❌ Произошла ошибка при удалении ключа.", show_alert=True)
         finally:
             db.close()
+
+    async def _handle_pwa_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
+        """Резервная ссылка для входа в self-service PWA — работает даже когда
+        в момент открытия ссылки Telegram недоступен, так как сессия в PWA
+        не привязана к живому Telegram-соединению."""
+        query = update.callback_query
+        await query.answer()
+
+        if not PWA_URL:
+            await query.message.reply_text("❌ PWA ещё не настроена администратором.")
+            return
+
+        try:
+            web_admin_url = WEB_SERVER_URL.replace(":8888", ":8889")
+            response = await self._make_http_request_with_retry(
+                'POST',
+                f"{web_admin_url}/api/auth/bot-link",
+                json={"telegram_id": db_user.telegram_id},
+                headers={"X-Bot-Secret": BOT_TOKEN},
+                timeout=15,
+            )
+
+            if response.status_code != 200:
+                logger.error(f"Failed to generate PWA link: {response.status_code}, {response.text}")
+                await query.message.reply_text("❌ Ошибка при создании ссылки. Попробуйте позже.")
+                return
+
+            result = response.json()
+            token = result.get('token')
+            pwa_url = f"{PWA_URL.rstrip('/')}/auth?token={token}"
+
+            text = (
+                "🌐 Личный кабинет (PWA)\n\n"
+                "Сохраните эту ссылку — она откроет ваш личный кабинет для управления "
+                "ключами, даже если Telegram в этот момент недоступен.\n\n"
+                "Ссылка действительна год, но лучше просто добавить PWA на главный экран "
+                "после первого открытия — тогда сессия останется активной."
+            )
+            keyboard = [[InlineKeyboardButton("🌐 Открыть личный кабинет", url=pwa_url)]]
+            await self._safe_edit_message_text(query, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            logger.error(f"Error generating PWA link: {e}", exc_info=True)
+            await query.message.reply_text("❌ Ошибка при создании ссылки. Попробуйте позже.")
 
     async def _handle_admin_web_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: User):
         """Генерация токена и открытие веб-панели"""

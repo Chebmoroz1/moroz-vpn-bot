@@ -62,6 +62,7 @@ BOT_LOGO_PATH = BASE_DIR / os.getenv("BOT_LOGO_PATH", "logo.png")
 # ВАЖНО: YooMoney не работает с IP-адресами, используйте домен
 WEB_SERVER_DOMAIN = os.getenv("WEB_SERVER_DOMAIN", "moroz.myftp.biz")
 WEB_SERVER_URL = os.getenv("WEB_SERVER_URL", f"http://{WEB_SERVER_DOMAIN}:8888")
+PWA_URL = os.getenv("PWA_URL", "")  # URL self-service PWA на Vercel, например https://pwa-vpn.vercel.app
 WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
 WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "8888"))
 

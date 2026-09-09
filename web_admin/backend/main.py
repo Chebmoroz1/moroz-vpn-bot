@@ -105,6 +105,7 @@ class VPNKeyResponse(BaseModel):
     subscription_period_days: Optional[int]
     purchase_date: Optional[datetime]
     is_test: bool
+    exclusion_list_hash: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -444,6 +445,38 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     return user
 
 
+class BotIssueTokenRequest(BaseModel):
+    telegram_id: int
+
+
+@app.post("/api/auth/bot-link", response_model=UserAuthTokenResponse)
+async def bot_issue_login_link(
+    payload: BotIssueTokenRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Внутренний эндпоинт: сам бот (уже доверяющий пользователю через живую
+    Telegram-сессию) просит выпустить токен для резервной ссылки входа в PWA
+    — на случай, если в момент, когда ссылка понадобится, Telegram недоступен.
+    Не для браузеров: авторизация — общий секрет (BOT_TOKEN) в заголовке,
+    а не CORS-доступный публичный флоу.
+    """
+    if request.headers.get("X-Bot-Secret") != BOT_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    user = db.query(User).filter(User.telegram_id == payload.telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    auth_token = generate_user_token(db, user.id)
+    return UserAuthTokenResponse(
+        token=auth_token.token,
+        expires_at=auth_token.expires_at,
+        is_active=user.is_active,
+    )
+
+
 @app.post("/api/auth/telegram", response_model=UserAuthTokenResponse)
 async def telegram_login(payload: TelegramAuthRequest, db: Session = Depends(get_db)):
     """
@@ -604,6 +637,44 @@ async def create_my_key(
     key_dict = {**vpn_key.__dict__}
     key_dict.pop('_sa_instance_state', None)
     return VPNKeyResponse(**key_dict)
+
+
+@app.get("/api/me/keys/{key_id}/config")
+async def download_my_key_config(
+    key_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    vpn_key = db.query(VPNKey).filter(VPNKey.id == key_id, VPNKey.user_id == user.id).first()
+    if not vpn_key or not vpn_key.config_file_path:
+        raise HTTPException(status_code=404, detail="Key not found")
+
+    config_path = Path(vpn_key.config_file_path)
+    if not config_path.exists():
+        raise HTTPException(status_code=404, detail="Config file missing on server")
+
+    return FileResponse(
+        config_path,
+        media_type="text/plain",
+        filename=f"{vpn_key.key_name}.conf",
+    )
+
+
+@app.get("/api/me/keys/{key_id}/qr")
+async def download_my_key_qr(
+    key_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    vpn_key = db.query(VPNKey).filter(VPNKey.id == key_id, VPNKey.user_id == user.id).first()
+    if not vpn_key or not vpn_key.qr_code_path:
+        raise HTTPException(status_code=404, detail="QR code not found")
+
+    qr_path = Path(vpn_key.qr_code_path)
+    if not qr_path.exists():
+        raise HTTPException(status_code=404, detail="QR file missing on server")
+
+    return FileResponse(qr_path, media_type="image/png", filename=f"{vpn_key.key_name}.png")
 
 
 @app.delete("/api/me/keys/{key_id}")
