@@ -581,6 +581,14 @@ class VPNManager:
             config_text = self._read_server_config()
             iface_lines, peers = self._parse_config_sections(config_text)
 
+            # Защита от внешней порчи файла (например, отдельным Amnezia GUI,
+            # который может писать пустой PresharedKey): убираем пустые поля,
+            # чтобы одна битая запись не блокировала все последующие peer'ы.
+            for p in peers:
+                for k in list(p.keys()):
+                    if not p[k]:
+                        del p[k]
+
             # Проверяем, нет ли уже такого peer
             for p in peers:
                 if p.get("PublicKey") == public_key:
@@ -600,7 +608,14 @@ class VPNManager:
 
             new_config = self._build_config(iface_lines, peers)
             self._write_server_config(new_config)
-            self._apply_server_config()
+            try:
+                self._apply_server_config()
+            except Exception:
+                # Откатываем файл, чтобы неудачное применение не оставило
+                # сервер в состоянии, которое ломает все последующие попытки.
+                logger.error("syncconf failed, rolling back wg0.conf to previous content")
+                self._write_server_config(config_text)
+                raise
 
             # Проверяем, что peer действительно добавлен
             verify_stdout, _, verify_exit = self._exec_command(
@@ -639,7 +654,12 @@ class VPNManager:
 
             new_config = self._build_config(iface_lines, peers)
             self._write_server_config(new_config)
-            self._apply_server_config()
+            try:
+                self._apply_server_config()
+            except Exception:
+                logger.error("syncconf failed, rolling back wg0.conf to previous content")
+                self._write_server_config(config_text)
+                raise
 
             logger.info(f"Peer {public_key[:30]}... removed successfully")
             return True
