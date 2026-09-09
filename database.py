@@ -33,6 +33,7 @@ class User(Base):
     deleted_at = Column(DateTime, nullable=True)  # Дата удаления
     activation_requested = Column(Boolean, default=False)  # Запрошена ли активация
     activation_requested_at = Column(DateTime, nullable=True)  # Дата запроса активации
+    split_tunneling_enabled = Column(Boolean, default=False)  # Раздельное туннелирование (PWA)
 
     # Связь с ключами
     vpn_keys = relationship("VPNKey", back_populates="user", cascade="all, delete-orphan")
@@ -68,6 +69,7 @@ class VPNKey(Base):
     payment_id = Column(Integer, ForeignKey('payments.id'), nullable=True)  # Связь с платежом
     is_test = Column(Boolean, default=False)  # Тестовый доступ
     reminder_sent = Column(Boolean, default=False)  # Отправлено ли напоминание
+    exclusion_list_hash = Column(String(64), nullable=True)  # Хэш списка excluded_sites на момент генерации конфига
 
     # Связь с пользователем
     user = relationship("User", back_populates="vpn_keys")
@@ -156,6 +158,37 @@ class TrafficStatistics(Base):
         return f"<TrafficStatistics(vpn_key_id={self.vpn_key_id}, date={self.date}, bytes_received={self.bytes_received}, bytes_sent={self.bytes_sent})>"
 
 
+class AuthToken(Base):
+    """Долгоживущий токен сессии для self-service PWA (persist через рестарты бэкенда)"""
+    __tablename__ = 'auth_tokens'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.now)
+    expires_at = Column(DateTime, nullable=False)
+    revoked = Column(Boolean, default=False)
+
+    user = relationship("User", backref="auth_tokens")
+
+    def __repr__(self):
+        return f"<AuthToken(user_id={self.user_id}, expires_at={self.expires_at}, revoked={self.revoked})>"
+
+
+class ExcludedSite(Base):
+    """Кураторский список сайтов, исключённых из VPN-туннеля (split tunneling)"""
+    __tablename__ = 'excluded_sites'
+
+    id = Column(Integer, primary_key=True)
+    host_or_ip = Column(String(255), nullable=False)  # домен (резолвится один раз при добавлении) или голый IP/CIDR
+    resolved_ip = Column(String(64), nullable=True)  # закэшированный резолв, если host_or_ip - домен
+    note = Column(String(255), nullable=True)
+    added_at = Column(DateTime, default=datetime.now)
+
+    def __repr__(self):
+        return f"<ExcludedSite(host_or_ip={self.host_or_ip}, resolved_ip={self.resolved_ip})>"
+
+
 # Инициализация базы данных с оптимизациями для конкурентного доступа
 # Используем QueuePool для лучшей производительности при конкурентных запросах
 # WAL mode будет включен в init_db()
@@ -233,6 +266,9 @@ def init_db():
         if 'activation_requested_at' not in user_columns:
             cursor.execute("ALTER TABLE users ADD COLUMN activation_requested_at TIMESTAMP")
             conn.commit()
+        if 'split_tunneling_enabled' not in user_columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN split_tunneling_enabled BOOLEAN DEFAULT 0")
+            conn.commit()
         # Разрешаем telegram_id быть NULL для пользователей, добавленных только по номеру
         # SQLite не поддерживает изменение NOT NULL, поэтому это делается при создании таблицы
         # Для существующих записей это не критично
@@ -260,6 +296,9 @@ def init_db():
             conn.commit()
         if 'reminder_sent' not in vpn_key_columns:
             cursor.execute("ALTER TABLE vpn_keys ADD COLUMN reminder_sent BOOLEAN DEFAULT 0")
+            conn.commit()
+        if 'exclusion_list_hash' not in vpn_key_columns:
+            cursor.execute("ALTER TABLE vpn_keys ADD COLUMN exclusion_list_hash VARCHAR(64)")
             conn.commit()
         
         # Миграция для таблицы traffic_statistics

@@ -668,12 +668,50 @@ class VPNManager:
             logger.error(f"Failed to remove peer: {e}", exc_info=True)
             return False
 
+    @staticmethod
+    def compute_allowed_ips(excluded_ips: Optional[List[str]] = None) -> str:
+        """
+        Строит значение AllowedIPs для клиентского конфига в режиме
+        сплит-туннелинга: "0.0.0.0/0 минус excluded_ips".
+
+        excluded_ips — список голых IPv4-адресов или CIDR (например, из
+        ExcludedSite.resolved_ip). Домены должны быть заранее зарезолвены
+        вызывающим кодом — эта функция работает только с IP.
+
+        Если excluded_ips пуст/None — возвращает полный туннель, как раньше.
+        """
+        if not excluded_ips:
+            return "0.0.0.0/0, ::/0"
+
+        networks: List[ipaddress.IPv4Network] = [ipaddress.ip_network("0.0.0.0/0")]
+        for raw_ip in excluded_ips:
+            try:
+                excluded_net = ipaddress.ip_network(raw_ip, strict=False)
+            except ValueError:
+                logger.warning(f"Skipping invalid excluded IP/CIDR: {raw_ip}")
+                continue
+
+            new_networks: List[ipaddress.IPv4Network] = []
+            for net in networks:
+                if net.subnet_of(excluded_net):
+                    # net целиком поглощён исключаемым блоком — выбрасываем
+                    continue
+                elif excluded_net.subnet_of(net):
+                    new_networks.extend(net.address_exclude(excluded_net))
+                else:
+                    new_networks.append(net)
+            networks = new_networks
+
+        cidr_list = sorted((str(n) for n in networks), key=lambda s: ipaddress.ip_network(s).network_address)
+        return ", ".join(cidr_list) + ", ::/0"
+
     def generate_config(
         self,
         private_key: str,
         client_ip: str,
         server_public_key: str,
         preshared_key: Optional[str] = None,
+        excluded_ips: Optional[List[str]] = None,
     ) -> str:
         """Генерация конфигурационного файла AmneziaWG"""
         # Пытаемся получить параметры AmneziaWG (Jc/Jmin/Jmax/S1/S2/H1–H4)
@@ -707,8 +745,7 @@ class VPNManager:
         lines.extend(
             [
                 f"Endpoint = {self.get_server_endpoint()}",
-                # Включаем и IPv4, и IPv6, как в рабочем iOS-конфиге
-                "AllowedIPs = 0.0.0.0/0, ::/0",
+                f"AllowedIPs = {self.compute_allowed_ips(excluded_ips)}",
                 "PersistentKeepalive = 25",
                 "",
             ]
@@ -772,11 +809,19 @@ class VPNManager:
             logger.error(f"Failed to generate QR code: {e}")
             return None
 
-    def create_vpn_key(self, user_id: int, key_name: str) -> Optional[Dict]:
+    def create_vpn_key(
+        self,
+        user_id: int,
+        key_name: str,
+        excluded_ips: Optional[List[str]] = None,
+    ) -> Optional[Dict]:
         """
         Создание VPN ключа для пользователя
         :param user_id: ID пользователя
         :param key_name: Имя ключа
+        :param excluded_ips: список IP/CIDR, которые НЕ должны идти через VPN
+            (сплит-туннелинг; список сайтов и его резолв в IP — забота вызывающего
+            кода, здесь только генерация AllowedIPs)
         :return: Словарь с данными ключа или None при ошибке
         """
         try:
@@ -825,6 +870,7 @@ class VPNManager:
                 client_ip,
                 server_public_key,
                 preshared_key=preshared_key,
+                excluded_ips=excluded_ips,
             )
 
             # 7. Сохраняем файл конфигурации
@@ -1241,7 +1287,9 @@ class VPNManager:
             public_key
         )
 
-    async def create_vpn_key_async(self, user_id: int, key_name: str) -> Optional[Dict]:
+    async def create_vpn_key_async(
+        self, user_id: int, key_name: str, excluded_ips: Optional[List[str]] = None
+    ) -> Optional[Dict]:
         """
         Асинхронная версия create_vpn_key
         Выполняет создание VPN ключа в отдельном потоке
@@ -1251,7 +1299,8 @@ class VPNManager:
             self.executor,
             self.create_vpn_key,
             user_id,
-            key_name
+            key_name,
+            excluded_ips
         )
 
     async def delete_vpn_key_async(self, public_key: Optional[str], key_name: str) -> bool:

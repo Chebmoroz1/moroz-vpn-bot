@@ -3,6 +3,9 @@ import asyncio
 import os
 import logging
 import secrets
+import hashlib
+import hmac
+import time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from pathlib import Path
@@ -23,7 +26,7 @@ import sys
 root_path = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(root_path))
 
-from database import SessionLocal, User, VPNKey, Payment, TrafficStatistics
+from database import SessionLocal, User, VPNKey, Payment, TrafficStatistics, AuthToken, ExcludedSite
 from sqlalchemy import func, and_
 from traffic_manager import traffic_manager
 from contacts import contacts_manager
@@ -308,16 +311,10 @@ else:
             "note": "React frontend not built. Run 'cd web_admin/frontend && npm install && npm run build'"
         }
 
-    @app.get("/{full_path:path}")
-    async def frontend_fallback(full_path: str):
-        """Чтобы не отдавать 404 на /proxy, /users и т.д. — отдаём ту же подсказку."""
-        if full_path.startswith("api") or full_path.startswith("docs") or full_path.startswith("openapi"):
-            raise HTTPException(status_code=404, detail="Not found")
-        return {
-            "message": "VPN Bot Admin Panel API",
-            "docs": "/docs",
-            "note": "React frontend not built. Run: cd web_admin/frontend && npm install && npm run build. Then restart vpn-web-admin."
-        }
+    # Catch-all с path-конвертером здесь регистрировался ДО всех API-роутов и,
+    # по правилам матчинга Starlette (первый подходящий маршрут побеждает),
+    # перехватывал вообще все GET-запросы ниже по файлу — включая /api/*.
+    # Единственный catch-all теперь — в конце файла, после всех API endpoints.
 
 
 @app.post("/api/auth/token", response_model=TokenResponse)
@@ -357,6 +354,291 @@ async def verify_auth(admin: User = Depends(get_current_admin)):
             "first_name": admin.first_name
         }
     }
+
+
+# ========== Self-service auth для PWA (не завязан на is_admin) ==========
+
+class TelegramAuthRequest(BaseModel):
+    id: int
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    username: Optional[str] = None
+    photo_url: Optional[str] = None
+    auth_date: int
+    hash: str
+
+
+class UserAuthTokenResponse(BaseModel):
+    token: str
+    expires_at: datetime
+    is_active: bool
+
+
+def verify_telegram_auth(data: Dict) -> bool:
+    """
+    Проверка подписи Telegram Login Widget.
+    https://core.telegram.org/widgets/login#checking-authorization
+    """
+    received_hash = data.get("hash")
+    if not received_hash or not BOT_TOKEN:
+        return False
+
+    check_fields = {
+        k: v for k, v in data.items()
+        if k != "hash" and v is not None
+    }
+    data_check_string = "\n".join(
+        f"{k}={check_fields[k]}" for k in sorted(check_fields.keys())
+    )
+    secret_key = hashlib.sha256(BOT_TOKEN.encode()).digest()
+    computed_hash = hmac.new(
+        secret_key, data_check_string.encode(), hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(computed_hash, received_hash):
+        return False
+
+    # Ссылка действительна ограниченное время, чтобы её нельзя было переиспользовать бесконечно
+    auth_date = int(data.get("auth_date", 0))
+    if time.time() - auth_date > 86400:
+        return False
+
+    return True
+
+
+def generate_user_token(db: Session, user_id: int, expires_days: int = 365) -> AuthToken:
+    """Долгоживущий персистентный токен (в БД, переживает рестарт бэкенда)"""
+    token = secrets.token_urlsafe(32)
+    auth_token = AuthToken(
+        user_id=user_id,
+        token=token,
+        expires_at=datetime.now() + timedelta(days=expires_days),
+    )
+    db.add(auth_token)
+    db.commit()
+    db.refresh(auth_token)
+    return auth_token
+
+
+def verify_user_token(db: Session, token: str) -> Optional[User]:
+    auth_token = (
+        db.query(AuthToken)
+        .filter(AuthToken.token == token, AuthToken.revoked.is_(False))
+        .first()
+    )
+    if not auth_token or datetime.now() > auth_token.expires_at:
+        return None
+    return db.query(User).filter(User.id == auth_token.user_id).first()
+
+
+def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
+    """Dependency для self-service роутов — не требует is_admin"""
+    token = request.query_params.get("token") or request.headers.get("X-Token")
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token not provided")
+
+    user = verify_user_token(db, token)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+
+    return user
+
+
+@app.post("/api/auth/telegram", response_model=UserAuthTokenResponse)
+async def telegram_login(payload: TelegramAuthRequest, db: Session = Depends(get_db)):
+    """
+    Вход в self-service PWA через Telegram Login Widget.
+    Не зависит от is_admin — доступен любому пользователю с telegram_id.
+    Новые пользователи создаются НЕактивными (та же модель, что и в боте:
+    активация — либо автопроверкой по существующему активному User, либо
+    вручную администратором через уже существующую admin-панель).
+    """
+    if not verify_telegram_auth(payload.model_dump()):
+        raise HTTPException(status_code=401, detail="Invalid Telegram auth data")
+
+    user = db.query(User).filter(User.telegram_id == payload.id).first()
+    if not user:
+        user = User(
+            telegram_id=payload.id,
+            username=payload.username,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            is_active=False,
+            max_keys=0,
+            activation_requested=True,
+            activation_requested_at=datetime.now(),
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    elif not user.is_active and not user.activation_requested:
+        user.activation_requested = True
+        user.activation_requested_at = datetime.now()
+        db.commit()
+
+    auth_token = generate_user_token(db, user.id)
+
+    return UserAuthTokenResponse(
+        token=auth_token.token,
+        expires_at=auth_token.expires_at,
+        is_active=user.is_active,
+    )
+
+
+# ========== Self-service эндпоинты для PWA ==========
+
+class MeResponse(BaseModel):
+    id: int
+    telegram_id: Optional[int]
+    username: Optional[str]
+    first_name: Optional[str]
+    is_active: bool
+    max_keys: int
+    keys_count: int
+    split_tunneling_enabled: bool
+    exclusion_list_hash: str
+
+
+class CreateMyKeyRequest(BaseModel):
+    key_name: Optional[str] = None
+
+
+class SplitTunnelingRequest(BaseModel):
+    enabled: bool
+
+
+def compute_exclusion_hash(db: Session) -> str:
+    """Хэш текущего кураторского списка сайтов — чтобы PWA могла определить,
+    что чей-то ключ выпущен по устаревшему списку и предложить обновить конфиг."""
+    sites = db.query(ExcludedSite).order_by(ExcludedSite.id).all()
+    raw = "|".join(f"{s.host_or_ip}:{s.resolved_ip or ''}" for s in sites)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def resolve_excluded_ips(db: Session) -> List[str]:
+    """IP/CIDR из кураторского списка, готовые для compute_allowed_ips().
+    Резолв домена в IP происходит один раз при добавлении в excluded_sites
+    (см. admin-flow) — здесь просто читаем закэшированное значение."""
+    sites = db.query(ExcludedSite).all()
+    return [s.resolved_ip or s.host_or_ip for s in sites]
+
+
+@app.get("/api/me", response_model=MeResponse)
+async def get_me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    keys_count = db.query(VPNKey).filter(VPNKey.user_id == user.id, VPNKey.is_active.is_(True)).count()
+    return MeResponse(
+        id=user.id,
+        telegram_id=user.telegram_id,
+        username=user.username,
+        first_name=user.first_name,
+        is_active=user.is_active,
+        max_keys=user.max_keys,
+        keys_count=keys_count,
+        split_tunneling_enabled=bool(user.split_tunneling_enabled),
+        exclusion_list_hash=compute_exclusion_hash(db),
+    )
+
+
+@app.get("/api/me/keys", response_model=List[VPNKeyResponse])
+async def get_my_keys(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    keys = db.query(VPNKey).filter(VPNKey.user_id == user.id).all()
+    result = []
+    for key in keys:
+        key_dict = {**key.__dict__}
+        key_dict.pop('_sa_instance_state', None)
+        result.append(VPNKeyResponse(**key_dict))
+    return result
+
+
+@app.post("/api/me/keys", response_model=VPNKeyResponse)
+async def create_my_key(
+    payload: CreateMyKeyRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Self-service выпуск ключа — прямой аналог кнопки "Получить ключ" в боте,
+    но без Telegram. Переиспользует VPNManager.create_vpn_key_async (vpn_manager.py)."""
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Аккаунт ещё не активирован администратором")
+
+    active_keys_count = db.query(VPNKey).filter(VPNKey.user_id == user.id, VPNKey.is_active.is_(True)).count()
+    if active_keys_count >= user.max_keys:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Достигнут лимит ключей ({user.max_keys}). Удалите неиспользуемый ключ, чтобы выпустить новый.",
+        )
+
+    from vpn_manager import vpn_manager
+
+    key_name = payload.key_name or f"pwa_{user.id}_{int(time.time())}"
+
+    excluded_ips = resolve_excluded_ips(db) if user.split_tunneling_enabled else None
+
+    try:
+        vpn_data = await vpn_manager.create_vpn_key_async(user.id, key_name, excluded_ips)
+    except Exception as e:
+        logger.error(f"Error creating self-service key for user {user.id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Не удалось создать ключ на сервере")
+
+    if not vpn_data:
+        raise HTTPException(status_code=500, detail="Не удалось создать ключ на сервере")
+
+    vpn_key = VPNKey(
+        user_id=user.id,
+        key_name=key_name,
+        config_file_path=str(vpn_data['config_path']),
+        qr_code_path=str(vpn_data['qr_path']) if vpn_data['qr_path'] else None,
+        protocol='amneziawg',
+        client_ip=vpn_data['client_ip'],
+        public_key=vpn_data['public_key'],
+        private_key=vpn_data['private_key'],
+        is_active=True,
+        created_by_bot=False,
+        access_type='free',
+        exclusion_list_hash=compute_exclusion_hash(db) if excluded_ips else None,
+    )
+    db.add(vpn_key)
+    db.commit()
+    db.refresh(vpn_key)
+
+    key_dict = {**vpn_key.__dict__}
+    key_dict.pop('_sa_instance_state', None)
+    return VPNKeyResponse(**key_dict)
+
+
+@app.delete("/api/me/keys/{key_id}")
+async def delete_my_key(
+    key_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    vpn_key = db.query(VPNKey).filter(VPNKey.id == key_id, VPNKey.user_id == user.id).first()
+    if not vpn_key:
+        raise HTTPException(status_code=404, detail="Key not found")
+
+    from vpn_manager import vpn_manager
+    try:
+        vpn_manager.delete_vpn_key(vpn_key.public_key, vpn_key.key_name)
+    except Exception as e:
+        logger.error(f"Error deleting key from WireGuard: {e}")
+
+    db.delete(vpn_key)
+    db.commit()
+
+    return {"success": True, "message": "Key deleted"}
+
+
+@app.put("/api/me/split-tunneling")
+async def set_split_tunneling(
+    payload: SplitTunnelingRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Переключает флаг у пользователя. Не меняет уже выданные ключи —
+    им нужно будет перевыпустить конфиг, чтобы новый AllowedIPs применился."""
+    user.split_tunneling_enabled = payload.enabled
+    db.commit()
+    return {"success": True, "split_tunneling_enabled": user.split_tunneling_enabled}
 
 
 @app.get("/api/users", response_model=List[UserResponse])
