@@ -457,7 +457,26 @@ def _get_telegram_jwks_client():
 
 def _find_or_create_user_from_telegram(db: Session, telegram_id: int, profile: Dict) -> User:
     """Та же модель активации, что и в боте: новые пользователи создаются
-    неактивными, активация — вручную администратором или автопроверкой."""
+    неактивными, активация — вручную администратором или автопроверкой.
+
+    ВАЖНО: `sub` в Telegram OIDC id_token — это pairwise-идентификатор,
+    уникальный для каждого клиента (client_id), а НЕ классический
+    Telegram user ID, которым везде в этой БД заполнен User.telegram_id
+    (тот приходит через Bot API). Поэтому для уже существующих пользователей
+    бота матчинг по telegram_id никогда не сработает — сначала пробуем
+    найти уже активного пользователя по username (та же логика
+    автопроверки, что и в боте при первом /start).
+    """
+    username = profile.get("username")
+    if username:
+        existing_active = (
+            db.query(User)
+            .filter(User.username == username, User.is_active.is_(True))
+            .first()
+        )
+        if existing_active:
+            return existing_active
+
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
     if not user:
         user = User(
