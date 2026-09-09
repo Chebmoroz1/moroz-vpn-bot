@@ -11,4 +11,5 @@ uvicorn[standard]==0.24.0
 pydantic==2.5.0
 python-multipart==0.0.20
 tenacity==8.2.3
+pyjwt==2.10.1
 

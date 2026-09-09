@@ -4,15 +4,16 @@ import os
 import logging
 import secrets
 import hashlib
-import hmac
+import base64
 import time
+import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -31,7 +32,7 @@ from sqlalchemy import func, and_
 from traffic_manager import traffic_manager
 from contacts import contacts_manager
 from proxy_stats import get_proxy_active_connection_ips
-from config import ADMIN_ID, BOT_TOKEN, WEB_SERVER_URL, YMONEY_CLIENT_ID, YMONEY_CLIENT_SECRET, YMONEY_REDIRECT_URI, YMONEY_WALLET, IPINFO_TOKEN
+from config import ADMIN_ID, BOT_TOKEN, WEB_SERVER_URL, YMONEY_CLIENT_ID, YMONEY_CLIENT_SECRET, YMONEY_REDIRECT_URI, YMONEY_WALLET, IPINFO_TOKEN, PWA_URL, TELEGRAM_OIDC_CLIENT_SECRET
 from yoomoney_helper import YooMoneyHelper
 from config_manager import config_manager
 from ipinfo_client import IPinfoClient
@@ -359,52 +360,10 @@ async def verify_auth(admin: User = Depends(get_current_admin)):
 
 # ========== Self-service auth для PWA (не завязан на is_admin) ==========
 
-class TelegramAuthRequest(BaseModel):
-    id: int
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    username: Optional[str] = None
-    photo_url: Optional[str] = None
-    auth_date: int
-    hash: str
-
-
 class UserAuthTokenResponse(BaseModel):
     token: str
     expires_at: datetime
     is_active: bool
-
-
-def verify_telegram_auth(data: Dict) -> bool:
-    """
-    Проверка подписи Telegram Login Widget.
-    https://core.telegram.org/widgets/login#checking-authorization
-    """
-    received_hash = data.get("hash")
-    if not received_hash or not BOT_TOKEN:
-        return False
-
-    check_fields = {
-        k: v for k, v in data.items()
-        if k != "hash" and v is not None
-    }
-    data_check_string = "\n".join(
-        f"{k}={check_fields[k]}" for k in sorted(check_fields.keys())
-    )
-    secret_key = hashlib.sha256(BOT_TOKEN.encode()).digest()
-    computed_hash = hmac.new(
-        secret_key, data_check_string.encode(), hashlib.sha256
-    ).hexdigest()
-
-    if not hmac.compare_digest(computed_hash, received_hash):
-        return False
-
-    # Ссылка действительна ограниченное время, чтобы её нельзя было переиспользовать бесконечно
-    auth_date = int(data.get("auth_date", 0))
-    if time.time() - auth_date > 86400:
-        return False
-
-    return True
 
 
 def generate_user_token(db: Session, user_id: int, expires_days: int = 365) -> AuthToken:
@@ -477,25 +436,33 @@ async def bot_issue_login_link(
     )
 
 
-@app.post("/api/auth/telegram", response_model=UserAuthTokenResponse)
-async def telegram_login(payload: TelegramAuthRequest, db: Session = Depends(get_db)):
-    """
-    Вход в self-service PWA через Telegram Login Widget.
-    Не зависит от is_admin — доступен любому пользователю с telegram_id.
-    Новые пользователи создаются НЕактивными (та же модель, что и в боте:
-    активация — либо автопроверкой по существующему активному User, либо
-    вручную администратором через уже существующую admin-панель).
-    """
-    if not verify_telegram_auth(payload.model_dump()):
-        raise HTTPException(status_code=401, detail="Invalid Telegram auth data")
+TELEGRAM_OIDC_ISSUER = "https://oauth.telegram.org"
+_telegram_jwks_client = None
 
-    user = db.query(User).filter(User.telegram_id == payload.id).first()
+
+def _get_telegram_bot_id() -> str:
+    """Числовой ID бота = часть BOT_TOKEN до двоеточия (client_id в OIDC)."""
+    return BOT_TOKEN.split(":")[0]
+
+
+def _get_telegram_jwks_client():
+    global _telegram_jwks_client
+    if _telegram_jwks_client is None:
+        import jwt as _jwt
+        _telegram_jwks_client = _jwt.PyJWKClient(f"{TELEGRAM_OIDC_ISSUER}/.well-known/jwks.json")
+    return _telegram_jwks_client
+
+
+def _find_or_create_user_from_telegram(db: Session, telegram_id: int, profile: Dict) -> User:
+    """Та же модель активации, что и в боте: новые пользователи создаются
+    неактивными, активация — вручную администратором или автопроверкой."""
+    user = db.query(User).filter(User.telegram_id == telegram_id).first()
     if not user:
         user = User(
-            telegram_id=payload.id,
-            username=payload.username,
-            first_name=payload.first_name,
-            last_name=payload.last_name,
+            telegram_id=telegram_id,
+            username=profile.get("username"),
+            first_name=profile.get("first_name"),
+            last_name=profile.get("last_name"),
             is_active=False,
             max_keys=0,
             activation_requested=True,
@@ -508,14 +475,128 @@ async def telegram_login(payload: TelegramAuthRequest, db: Session = Depends(get
         user.activation_requested = True
         user.activation_requested_at = datetime.now()
         db.commit()
+    return user
 
+
+def _telegram_oidc_redirect_uri(request: Request) -> str:
+    return f"{request.url.scheme}://{request.url.netloc}/api/auth/telegram/callback"
+
+
+@app.get("/api/auth/telegram/start")
+async def telegram_oidc_start(request: Request):
+    """
+    Начало входа через Telegram OIDC (заменил устаревший telegram-widget.js —
+    старый HMAC-виджет Telegram больше не рендерится корректно для ботов,
+    переведённых на новую систему Login). PKCE обязателен для этого флоу.
+    """
+    client_id = _get_telegram_bot_id()
+    redirect_uri = _telegram_oidc_redirect_uri(request)
+
+    state = secrets.token_urlsafe(16)
+    code_verifier = secrets.token_urlsafe(32)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).decode().rstrip("=")
+
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid profile",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    from urllib.parse import urlencode
+    auth_url = f"{TELEGRAM_OIDC_ISSUER}/auth?{urlencode(params)}"
+
+    response = RedirectResponse(auth_url)
+    cookie_opts = dict(httponly=True, secure=True, samesite="lax", path="/", max_age=600)
+    response.set_cookie("tg_oidc_state", state, **cookie_opts)
+    response.set_cookie("tg_oidc_verifier", code_verifier, **cookie_opts)
+    return response
+
+
+@app.get("/api/auth/telegram/callback")
+async def telegram_oidc_callback(request: Request, db: Session = Depends(get_db)):
+    """Обмен authorization code на id_token, проверка подписи через JWKS,
+    выпуск нашего собственного персистентного токена и редирект в PWA."""
+    def redirect_with_error(err: str) -> RedirectResponse:
+        resp = RedirectResponse(f"{PWA_URL}/login?error={err}")
+        resp.delete_cookie("tg_oidc_state")
+        resp.delete_cookie("tg_oidc_verifier")
+        return resp
+
+    params = dict(request.query_params)
+    if "error" in params:
+        logger.error(f"Telegram OIDC provider error: {params.get('error')}")
+        return redirect_with_error("telegram_denied")
+
+    code = params.get("code")
+    if not code:
+        return redirect_with_error("telegram_missing_code")
+
+    cookie_state = request.cookies.get("tg_oidc_state")
+    code_verifier = request.cookies.get("tg_oidc_verifier")
+    if not cookie_state or not code_verifier or params.get("state") != cookie_state:
+        return redirect_with_error("telegram_state")
+
+    client_id = _get_telegram_bot_id()
+    if not TELEGRAM_OIDC_CLIENT_SECRET:
+        logger.error("TELEGRAM_OIDC_CLIENT_SECRET not set")
+        return redirect_with_error("telegram_config")
+
+    redirect_uri = _telegram_oidc_redirect_uri(request)
+
+    try:
+        token_resp = requests.post(
+            f"{TELEGRAM_OIDC_ISSUER}/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": client_id,
+                "client_secret": TELEGRAM_OIDC_CLIENT_SECRET,
+                "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier,
+            },
+            timeout=15,
+        )
+        token_data = token_resp.json()
+    except Exception as e:
+        logger.error(f"Telegram OIDC token exchange request failed: {e}")
+        return redirect_with_error("telegram_token_failed")
+
+    if token_resp.status_code != 200 or "id_token" not in token_data:
+        logger.error(f"Telegram OIDC token exchange failed: {token_data}")
+        return redirect_with_error("telegram_token_failed")
+
+    import jwt as _jwt
+    try:
+        signing_key = _get_telegram_jwks_client().get_signing_key_from_jwt(token_data["id_token"])
+        payload = _jwt.decode(
+            token_data["id_token"],
+            signing_key.key,
+            algorithms=["RS256", "ES256"],
+            audience=client_id,
+            issuer=TELEGRAM_OIDC_ISSUER,
+        )
+    except Exception as e:
+        logger.error(f"Telegram OIDC JWT verification failed: {e}")
+        return redirect_with_error("telegram_invalid")
+
+    telegram_id = int(payload["sub"])
+    profile = {
+        "username": payload.get("preferred_username"),
+        "first_name": payload.get("given_name"),
+        "last_name": payload.get("family_name"),
+    }
+    user = _find_or_create_user_from_telegram(db, telegram_id, profile)
     auth_token = generate_user_token(db, user.id)
 
-    return UserAuthTokenResponse(
-        token=auth_token.token,
-        expires_at=auth_token.expires_at,
-        is_active=user.is_active,
-    )
+    response = RedirectResponse(f"{PWA_URL}/auth?token={auth_token.token}")
+    response.delete_cookie("tg_oidc_state")
+    response.delete_cookie("tg_oidc_verifier")
+    return response
 
 
 # ========== Self-service эндпоинты для PWA ==========
